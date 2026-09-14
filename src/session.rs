@@ -17,6 +17,7 @@ use std::time::{Duration, SystemTime};
 use transport::Arrived;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::socket;
+use transport::sql::{self, Answering, Inserted, Rows};
 
 use crate::client::Login;
 use crate::tns;
@@ -40,6 +41,15 @@ pub enum Event {
     Executed(String),
 }
 
+impl Inserted for Event {
+    fn inserted(self) -> Option<Arrived> {
+        match self {
+            Self::Inserted(arrived) => Some(arrived),
+            Self::Selected(_) | Self::Executed(_) => None,
+        }
+    }
+}
+
 /// How a statement is answered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Answer {
@@ -55,8 +65,6 @@ pub enum Answer {
     },
 }
 
-type Answering = Box<dyn FnMut(&str) -> Option<Answer> + Send>;
-
 pub struct Session {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -64,8 +72,8 @@ pub struct Session {
     user: String,
     service: String,
     columns: Vec<String>,
-    rows: Vec<Vec<Option<Vec<u8>>>>,
-    answering: Option<Answering>,
+    rows: Rows<Vec<u8>>,
+    answering: Option<Answering<Answer>>,
 }
 
 /// Ids handed out, one a session, so no two challenges are the same.
@@ -158,11 +166,7 @@ impl Session {
     /// Answer any SELECT with these `columns` and `rows`.
     #[must_use]
     pub fn with_table(mut self, columns: &[&str], rows: &[&[Option<&[u8]>]]) -> Self {
-        self.columns = columns.iter().map(ToString::to_string).collect();
-        self.rows = rows
-            .iter()
-            .map(|row| row.iter().map(|v| v.map(<[u8]>::to_vec)).collect())
-            .collect();
+        (self.columns, self.rows) = sql::table(columns, rows);
         self
     }
 
@@ -182,13 +186,7 @@ impl Session {
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
     pub fn next_insert(&mut self) -> Result<Option<Arrived>> {
-        loop {
-            match self.next_event()? {
-                Some(Event::Inserted(arrived)) => return Ok(Some(arrived)),
-                Some(_) => {}
-                None => return Ok(None),
-            }
-        }
+        sql::next_insert(|| self.next_event())
     }
 
     /// The next statement the client ran, answered, or `None` when it
@@ -234,11 +232,7 @@ impl Session {
         if let Some(answer) = self.answering.as_mut().and_then(|f| f(sql)) {
             return (answer, Event::Executed(sql.to_string()));
         }
-        let verb = sql
-            .split_whitespace()
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
+        let verb = sql::verb(sql);
         match verb.as_str() {
             "SELECT" => (
                 Answer::Rows {

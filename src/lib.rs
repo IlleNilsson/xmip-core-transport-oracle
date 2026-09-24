@@ -223,7 +223,7 @@ impl OracleTransport {
 }
 
 impl Accepting for OracleTransport {
-    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
         let mut session = self.accept_one(listener)?;
         let arrived = session
             .next_insert()?
@@ -237,8 +237,7 @@ impl Accepting for OracleTransport {
 
 impl Loopback for OracleTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening::new(self.clone(), listener, address)))
+        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
     /// INSERT the payload as one bound RAW from a fresh near end logging in

@@ -13,7 +13,7 @@ use transport::error::{Result, TransportError, protocol_error};
 use transport::socket;
 
 use crate::tns;
-use crate::ttc::{self, Message, tag};
+use crate::ttc::{self, Message, Ttc, TtcWrite, tag};
 
 /// What a login presents.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,10 +84,10 @@ impl Client {
             return Err(tns::refused(&accept));
         }
         let mut protocol = Vec::new();
-        ttc::put_str(&mut protocol, BANNER);
+        protocol.string(BANNER);
         self.send(tag::PROTOCOL, protocol)?;
         let answer = self.expect(tag::PROTOCOL)?;
-        self.banner = answer.reader().string()?;
+        self.banner = answer.cursor().string()?;
         self.send(tag::DATA_TYPES, Vec::new())?;
         self.expect(tag::DATA_TYPES)?;
         Ok(())
@@ -95,18 +95,18 @@ impl Client {
 
     fn authenticate(&mut self, login: &Login) -> Result<()> {
         let mut request = Vec::new();
-        ttc::put_str(&mut request, &login.user);
+        request.string(&login.user);
         self.send(tag::SESSION_KEY_REQUEST, request)?;
         let key = self.expect(tag::SESSION_KEY)?;
         let challenge = key
-            .reader()
-            .bytes()?
+            .cursor()
+            .counted()?
             .try_into()
             .map_err(|_| protocol_error("the session key was not sixteen bytes"))?;
         let verifier = ttc::verifier(&challenge, login.password.as_bytes());
         let mut auth = Vec::new();
-        ttc::put_str(&mut auth, &login.user);
-        ttc::put_bytes(&mut auth, &verifier);
+        auth.string(&login.user);
+        auth.counted(&verifier);
         self.send(tag::AUTHENTICATE, auth)?;
         match self.next()? {
             message if message.tag == tag::AUTH_ACCEPTED => Ok(()),
@@ -127,24 +127,24 @@ impl Client {
     /// Where the server went away or answered with an error.
     pub fn query(&mut self, sql: &str, bind: Option<&[u8]>) -> Result<QueryResult> {
         let mut body = Vec::new();
-        ttc::put_str(&mut body, sql);
-        ttc::put_value(&mut body, bind);
+        body.string(sql);
+        body.value(bind);
         self.send(tag::EXECUTE, body)?;
         let mut result = QueryResult::default();
         loop {
             let message = self.next()?;
             match message.tag {
                 tag::DESCRIBE => {
-                    let mut reader = message.reader();
+                    let mut reader = message.cursor();
                     result.columns = reader
-                        .array()?
+                        .values()?
                         .into_iter()
                         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
                         .collect();
                 }
                 tag::ROW => result.rows.push(read_row(&message)?),
                 tag::STATUS => {
-                    result.affected_rows = message.reader().u64()?;
+                    result.affected_rows = message.cursor().long()?;
                     return Ok(result);
                 }
                 tag::ERROR => return Err(error_of(&message)),
@@ -193,16 +193,16 @@ impl Client {
 
 /// The `(name, value)` of a row's columns.
 fn read_row(message: &Message) -> Result<Vec<Option<Vec<u8>>>> {
-    let mut reader = message.reader();
-    let count = u16::from_be_bytes([reader.u8()?, reader.u8()?]) as usize;
-    (0..count).map(|_| ttc::take_value(&mut reader)).collect()
+    let mut reader = message.cursor();
+    let count = usize::from(reader.u16_be()?);
+    (0..count).map(|_| reader.value()).collect()
 }
 
 /// The error an error message carries; `ORA-00600` and class say whether
 /// a later attempt might fare better.
 fn error_of(message: &Message) -> TransportError {
-    let mut reader = message.reader();
-    let Ok(code) = reader.u32() else {
+    let mut reader = message.cursor();
+    let Ok(code) = reader.integer() else {
         return protocol_error("a malformed error message");
     };
     let text = reader.string().unwrap_or_default();

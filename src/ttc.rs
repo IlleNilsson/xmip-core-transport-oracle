@@ -16,6 +16,8 @@
 
 use std::io::{Read, Write};
 
+use codec::cursor::Cursor;
+use codec::writer::ByteWriter;
 use transport::error::{Result, protocol_error};
 
 use crate::tns;
@@ -50,134 +52,123 @@ pub mod tag {
     pub const LOGOFF: u8 = 0x0c;
 }
 
-/// Append a count or length: two bytes, big-endian.
-pub fn put_count(out: &mut Vec<u8>, count: usize) {
-    out.extend_from_slice(&u16::try_from(count).unwrap_or(u16::MAX).to_be_bytes());
-}
-
-/// Append counted opaque bytes.
-pub fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
-    put_count(out, bytes.len());
-    out.extend_from_slice(bytes);
-}
-
-/// Append a counted string.
-pub fn put_str(out: &mut Vec<u8>, text: &str) {
-    put_bytes(out, text.as_bytes());
-}
-
-/// A reader over one message body.
-pub struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    #[must_use]
-    pub const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, at: 0 }
-    }
-
-    /// Counted opaque bytes.
+/// Reading TTC's own fields off codec's cursor.
+pub trait Ttc<'a> {
+    /// Counted opaque bytes: a big-endian two-byte length, then the bytes.
     ///
     /// # Errors
     /// Where the body ends first.
-    pub fn bytes(&mut self) -> Result<&'a [u8]> {
-        if self.at + 2 > self.bytes.len() {
-            return Err(protocol_error("a TTC field cut short"));
-        }
-        let len = u16::from_be_bytes([self.bytes[self.at], self.bytes[self.at + 1]]) as usize;
-        let start = self.at + 2;
-        let end = start
-            .checked_add(len)
-            .filter(|end| *end <= self.bytes.len())
-            .ok_or_else(|| protocol_error("a TTC field longer than its message"))?;
-        self.at = end;
-        Ok(&self.bytes[start..end])
-    }
+    fn counted(&mut self) -> Result<&'a [u8]>;
 
     /// A counted string, read as UTF-8, lossily.
     ///
     /// # Errors
     /// Where the body ends first.
-    pub fn string(&mut self) -> Result<String> {
-        Ok(String::from_utf8_lossy(self.bytes()?).into_owned())
-    }
+    fn string(&mut self) -> Result<String>;
 
-    /// One unsigned byte.
+    /// A counted big-endian integer, which must be four bytes.
+    ///
+    /// # Errors
+    /// Where the body ends first or the count is not four.
+    fn integer(&mut self) -> Result<u32>;
+
+    /// A counted big-endian long, which must be eight bytes.
+    ///
+    /// # Errors
+    /// Where the body ends first or the count is not eight.
+    fn long(&mut self) -> Result<u64>;
+
+    /// A two-byte count, then that many counted values.
     ///
     /// # Errors
     /// Where the body ends first.
-    pub fn u8(&mut self) -> Result<u8> {
-        let byte = *self
-            .bytes
-            .get(self.at)
-            .ok_or_else(|| protocol_error("a TTC byte past the end"))?;
-        self.at += 1;
-        Ok(byte)
-    }
+    fn values(&mut self) -> Result<Vec<Vec<u8>>>;
 
-    /// A big-endian u32.
+    /// A column value (see [`TtcWrite::value`]), `None` where it is NULL.
     ///
     /// # Errors
     /// Where the body ends first.
-    pub fn u32(&mut self) -> Result<u32> {
-        let bytes = self.bytes()?;
-        if bytes.len() != 4 {
-            return Err(protocol_error("a TTC integer that is not four bytes"));
-        }
-        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    fn value(&mut self) -> Result<Option<Vec<u8>>>;
+}
+
+impl<'a> Ttc<'a> for Cursor<'a> {
+    fn counted(&mut self) -> Result<&'a [u8]> {
+        let length = usize::from(self.u16_be()?);
+        Ok(self.take(length)?)
     }
 
-    /// A big-endian u64.
-    ///
-    /// # Errors
-    /// Where the body ends first.
-    pub fn u64(&mut self) -> Result<u64> {
-        let bytes = self.bytes()?;
-        if bytes.len() != 8 {
-            return Err(protocol_error("a TTC long that is not eight bytes"));
-        }
-        let mut value = [0u8; 8];
-        value.copy_from_slice(bytes);
-        Ok(u64::from_be_bytes(value))
+    fn string(&mut self) -> Result<String> {
+        Ok(String::from_utf8_lossy(self.counted()?).into_owned())
     }
 
-    /// A counted array of counted values.
-    ///
-    /// # Errors
-    /// Where the body ends first.
-    pub fn array(&mut self) -> Result<Vec<Vec<u8>>> {
-        let count = u16::from_be_bytes([self.u8()?, self.u8()?]) as usize;
+    fn integer(&mut self) -> Result<u32> {
+        let bytes: [u8; 4] = self
+            .counted()?
+            .try_into()
+            .map_err(|_| protocol_error("a TTC integer that is not four bytes"))?;
+        Ok(u32::from_be_bytes(bytes))
+    }
+
+    fn long(&mut self) -> Result<u64> {
+        let bytes: [u8; 8] = self
+            .counted()?
+            .try_into()
+            .map_err(|_| protocol_error("a TTC long that is not eight bytes"))?;
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    fn values(&mut self) -> Result<Vec<Vec<u8>>> {
+        let count = usize::from(self.u16_be()?);
         (0..count)
-            .map(|_| self.bytes().map(<[u8]>::to_vec))
+            .map(|_| self.counted().map(<[u8]>::to_vec))
             .collect()
     }
-}
 
-/// A column value: a present byte — one for a value, zero for NULL — then
-/// the value's counted bytes where it is present. A genuine empty value
-/// and a NULL are then two different shapes, which is what a database
-/// needs them to be.
-pub fn put_value(out: &mut Vec<u8>, value: Option<&[u8]>) {
-    match value {
-        Some(bytes) => {
-            out.push(1);
-            put_bytes(out, bytes);
+    fn value(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.byte()? == 0 {
+            return Ok(None);
         }
-        None => out.push(0),
+        Ok(Some(self.counted()?.to_vec()))
     }
 }
 
-/// The value at the reader, `None` where it is NULL.
-///
-/// # Errors
-/// Where the body ends first.
-pub fn take_value(reader: &mut Reader<'_>) -> Result<Option<Vec<u8>>> {
-    if reader.u8()? == 0 {
-        return Ok(None);
+/// Writing TTC's own fields beside codec's [`ByteWriter`].
+pub trait TtcWrite {
+    /// A count or length: two bytes, big-endian, saturating.
+    fn count(&mut self, count: usize) -> &mut Self;
+
+    /// Counted opaque bytes.
+    fn counted(&mut self, bytes: &[u8]) -> &mut Self;
+
+    /// A counted string.
+    fn string(&mut self, text: &str) -> &mut Self;
+
+    /// A column value: a present byte — one for a value, zero for NULL —
+    /// then the value's counted bytes where it is present. A genuine empty
+    /// value and a NULL are then two different shapes, which is what a
+    /// database needs them to be.
+    fn value(&mut self, value: Option<&[u8]>) -> &mut Self;
+}
+
+impl TtcWrite for Vec<u8> {
+    fn count(&mut self, count: usize) -> &mut Self {
+        self.u16_be(u16::try_from(count).unwrap_or(u16::MAX))
     }
-    Ok(Some(reader.bytes()?.to_vec()))
+
+    fn counted(&mut self, bytes: &[u8]) -> &mut Self {
+        self.count(bytes.len()).bytes(bytes)
+    }
+
+    fn string(&mut self, text: &str) -> &mut Self {
+        self.counted(text.as_bytes())
+    }
+
+    fn value(&mut self, value: Option<&[u8]>) -> &mut Self {
+        match value {
+            Some(bytes) => self.byte(1).counted(bytes),
+            None => self.byte(0),
+        }
+    }
 }
 
 /// The O5LOGON verifier, stood in (see the module doc): the sixteen-byte
@@ -242,10 +233,10 @@ impl Message {
         })
     }
 
-    /// A reader over this message's body.
+    /// A cursor over this message's body.
     #[must_use]
-    pub fn reader(&self) -> Reader<'_> {
-        Reader::new(&self.body)
+    pub fn cursor(&self) -> Cursor<'_> {
+        Cursor::new(&self.body)
     }
 }
 
@@ -289,17 +280,16 @@ mod tests {
     #[test]
     fn a_message_carries_its_tag_and_its_counted_fields() {
         let mut body = Vec::new();
-        put_str(&mut body, "orders");
-        put_bytes(&mut body, &[0, 0xff]);
+        body.string("orders").counted(&[0, 0xff]);
         let message = Message {
             tag: tag::EXECUTE,
             body,
         };
         let read = Message::from_payload(&message.to_payload()).expect("message");
         assert_eq!(read, message);
-        let mut reader = read.reader();
+        let mut reader = read.cursor();
         assert_eq!(reader.string().expect("service"), "orders");
-        assert_eq!(reader.bytes().expect("bind"), &[0, 0xff]);
+        assert_eq!(reader.counted().expect("bind"), &[0, 0xff]);
         assert!(Message::from_payload(&[]).is_err());
         assert_eq!(Message::bare(tag::LOGOFF).to_payload(), [tag::LOGOFF]);
     }
@@ -307,24 +297,27 @@ mod tests {
     #[test]
     fn integers_arrays_and_values_read_back() {
         let mut body = Vec::new();
-        put_bytes(&mut body, &7u32.to_be_bytes());
-        put_bytes(&mut body, &9u64.to_be_bytes());
-        body.extend_from_slice(&2u16.to_be_bytes());
-        put_bytes(&mut body, b"a");
-        put_bytes(&mut body, b"bc");
-        put_value(&mut body, Some(b"x"));
-        put_value(&mut body, None);
-        let mut reader = Reader::new(&body);
-        assert_eq!(reader.u32().expect("u32"), 7);
-        assert_eq!(reader.u64().expect("u64"), 9);
+        body.counted(&7u32.to_be_bytes())
+            .counted(&9u64.to_be_bytes())
+            .count(2)
+            .counted(b"a")
+            .counted(b"bc")
+            .value(Some(b"x"))
+            .value(None);
+        let mut reader = Cursor::new(&body);
+        assert_eq!(reader.integer().expect("u32"), 7);
+        assert_eq!(reader.long().expect("u64"), 9);
         assert_eq!(
-            reader.array().expect("array"),
+            reader.values().expect("values"),
             vec![b"a".to_vec(), b"bc".to_vec()]
         );
-        assert_eq!(take_value(&mut reader).expect("value"), Some(b"x".to_vec()));
-        assert_eq!(take_value(&mut reader).expect("null"), None);
-        assert!(Reader::new(&[0, 5, 1]).bytes().is_err(), "cut short");
-        assert!(Reader::new(&[]).u8().is_err());
+        assert_eq!(reader.value().expect("value"), Some(b"x".to_vec()));
+        assert_eq!(reader.value().expect("null"), None);
+        let error = Cursor::new(&[0, 5, 1]).counted().expect_err("cut short");
+        assert!(!error.retryable);
+        assert!(error.message.contains("runs past"), "{error}");
+        assert!(Cursor::new(&[0, 1, 7]).integer().is_err(), "not four bytes");
+        assert!(Cursor::new(&[]).byte().is_err());
     }
 
     #[test]

@@ -21,7 +21,7 @@ use transport::sql::{self, Answering, Inserted, Rows};
 
 use crate::client::Login;
 use crate::tns;
-use crate::ttc::{self, Message, tag, verifier};
+use crate::ttc::{self, Message, Ttc, TtcWrite, tag, verifier};
 
 /// The number Oracle answers a refused login with (`ORA-01017`).
 pub const INVALID_CREDENTIAL: u32 = 1017;
@@ -118,9 +118,9 @@ impl Session {
         self.service = service_name(&tns::read_connect(&connect)?);
         tns::accept().write(&mut self.writer)?;
         let protocol = self.expect(tag::PROTOCOL)?;
-        let _ = protocol.reader().string()?;
+        let _ = protocol.cursor().string()?;
         let mut answer = Vec::new();
-        ttc::put_str(&mut answer, SERVER_BANNER);
+        answer.string(SERVER_BANNER);
         self.send(tag::PROTOCOL, answer)?;
         self.expect(tag::DATA_TYPES)?;
         self.send(tag::DATA_TYPES, Vec::new())
@@ -128,15 +128,15 @@ impl Session {
 
     fn authenticate(&mut self, expected: Option<&Login>) -> Result<()> {
         let request = self.expect(tag::SESSION_KEY_REQUEST)?;
-        let user = request.reader().string()?;
+        let user = request.cursor().string()?;
         let challenge = fresh_challenge(&self.peer);
         let mut key = Vec::new();
-        ttc::put_bytes(&mut key, &challenge);
+        key.counted(&challenge);
         self.send(tag::SESSION_KEY, key)?;
         let auth = self.expect(tag::AUTHENTICATE)?;
-        let mut reader = auth.reader();
+        let mut reader = auth.cursor();
         self.user = reader.string()?;
-        let offered = reader.bytes()?;
+        let offered = reader.counted()?;
         let accepted = expected.is_none_or(|login| {
             self.user == login.user && offered == verifier(&challenge, login.password.as_bytes())
         });
@@ -208,9 +208,9 @@ impl Session {
                 message.tag
             )));
         }
-        let mut reader = message.reader();
+        let mut reader = message.cursor();
         let sql = reader.string()?;
-        let bind = ttc::take_value(&mut reader)?;
+        let bind = reader.value()?;
         let (answer, event) = self.answer(&sql, bind);
         self.write_answer(&answer)?;
         Ok(Some(event))
@@ -262,16 +262,16 @@ impl Session {
         match answer {
             Answer::Rows { columns, rows } => {
                 let mut describe = Vec::new();
-                ttc::put_count(&mut describe, columns.len());
+                describe.count(columns.len());
                 for column in columns {
-                    ttc::put_str(&mut describe, column);
+                    describe.string(column);
                 }
                 self.send(tag::DESCRIBE, describe)?;
                 for row in rows {
                     let mut body = Vec::new();
-                    ttc::put_count(&mut body, row.len());
+                    body.count(row.len());
                     for value in row {
-                        ttc::put_value(&mut body, value.as_deref());
+                        body.value(value.as_deref());
                     }
                     self.send(tag::ROW, body)?;
                 }
@@ -284,14 +284,14 @@ impl Session {
 
     fn send_status(&mut self, rows: u64) -> Result<()> {
         let mut body = Vec::new();
-        ttc::put_bytes(&mut body, &rows.to_be_bytes());
+        body.counted(&rows.to_be_bytes());
         self.send(tag::STATUS, body)
     }
 
     fn send_error(&mut self, code: u32, message: &str) -> Result<()> {
         let mut body = Vec::new();
-        ttc::put_bytes(&mut body, &code.to_be_bytes());
-        ttc::put_str(&mut body, message);
+        body.counted(&code.to_be_bytes());
+        body.string(message);
         self.send(tag::ERROR, body)
     }
 

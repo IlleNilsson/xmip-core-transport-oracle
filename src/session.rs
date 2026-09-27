@@ -14,12 +14,10 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use codec::sql::Delimiter;
-use transport::Arrived;
 use transport::error::{Result, TransportError, protocol_error};
-use transport::socket;
 use transport::sql::{self, Answering, Dialect, Inserted, Rows};
+use transport::{Arrived, Login, socket};
 
-use crate::client::Login;
 use crate::tns;
 use crate::ttc::{self, Message, Ttc, TtcWrite, tag, verifier};
 
@@ -262,10 +260,14 @@ impl Session {
                     Event::Inserted(Arrived::new(origin, bind.unwrap_or_default())),
                 )
             }
+            // What a client that keeps its session commits with, where a
+            // logoff would have committed.
+            "COMMIT" => (Answer::Complete(0), Event::Executed(sql.to_string())),
             _ => (
                 Answer::Error {
                     code: INVALID_STATEMENT,
-                    message: "only SELECT and INSERT ... VALUES (:1) are served here".to_string(),
+                    message: "only SELECT, INSERT ... VALUES (:1) and COMMIT are served here"
+                        .to_string(),
                 },
                 Event::Executed(sql.to_string()),
             ),

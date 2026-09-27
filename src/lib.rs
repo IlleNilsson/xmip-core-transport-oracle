@@ -53,7 +53,8 @@ use transport::error::{Result, TransportError, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
@@ -213,6 +214,59 @@ impl Transport for OracleTransport {
     }
 }
 
+impl Configured for OracleTransport {
+    /// The address is the listener's host and port: where a Location
+    /// connects.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "service",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The service name a Location connects for and reads or inserts in.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "user",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The user a Location logs in as.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "query",
+                kind: Kind::Text,
+                presence: Presence::Default(Fixed::Text(DEFAULT_QUERY)),
+                meaning: "The query a receive runs: the first column names the row, the last \
+                          is the Stream.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-packet is waited on; unbounded \
+                          when left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    /// The password comes through the Location's credentials, never a
+    /// setting.
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let mut transport = Self::new(address, settings.text("service"), settings.text("user"));
+        if let Some(query) = settings.optional_text("query") {
+            transport = transport.with_query(query);
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl OracleTransport {
     /// Both ends on this machine: an ephemeral local port, a login with no
     /// password, the loopback timeout.
@@ -258,6 +312,28 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn oracle_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(OracleTransport::SETTINGS.problems(), Vec::<String>::new());
+        let text = |name: &str, value: &str| (name.to_string(), Given::Text(value.to_string()));
+        let given = [
+            text("service", "ORDERS"),
+            text("user", "xmip"),
+            text("query", "SELECT id, body FROM outbox"),
+            text("timeout", "2s"),
+        ];
+        let built = OracleTransport::open("db:1521", Applies::Receive, &given).expect("built");
+        assert_eq!(built.server, "db:1521");
+        assert_eq!(built.service, "ORDERS");
+        assert_eq!(built.query, "SELECT id, body FROM outbox");
+        assert_eq!(built.timeout, Some(secs(2)));
+        let Err(refused) = OracleTransport::open("db:1521", Applies::Send, &given[..3]) else {
+            panic!("query is a receive setting");
+        };
+        assert!(refused.message.contains("\"query\""), "{}", refused.message);
     }
 
     #[test]

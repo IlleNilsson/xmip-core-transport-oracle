@@ -11,17 +11,30 @@
 
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
+use codec::sql::Delimiter;
 use transport::Arrived;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::socket;
-use transport::sql::{self, Answering, Inserted, Rows};
+use transport::sql::{self, Answering, Dialect, Inserted, Rows};
 
 use crate::client::Login;
 use crate::tns;
 use crate::ttc::{self, Message, Ttc, TtcWrite, tag, verifier};
+
+/// Oracle as the capability writes and reads it: a target opens with
+/// `oracle://`, names a service, and an identifier is double-quoted with
+/// `""` for a quote, its case kept, or bare with `_ . $ #` in it.
+pub const DIALECT: Dialect = Dialect {
+    schemes: &["oracle"],
+    catalog: "service",
+    identifier: Delimiter::IDENTIFIER,
+    bare: &['_', '.', '$', '#'],
+};
+
+/// The bind marker the one INSERT carries its RAW in.
+pub const BIND: &str = ":1";
 
 /// The number Oracle answers a refused login with (`ORA-01017`).
 pub const INVALID_CREDENTIAL: u32 = 1017;
@@ -76,9 +89,6 @@ pub struct Session {
     answering: Option<Answering<Answer>>,
 }
 
-/// Ids handed out, one a session, so no two challenges are the same.
-static SESSIONS: AtomicU32 = AtomicU32::new(1);
-
 impl Session {
     /// Accept one client on `listener`, negotiate, and log it in: against
     /// `expected` where there is one, taking any login where there is not.
@@ -129,7 +139,7 @@ impl Session {
     fn authenticate(&mut self, expected: Option<&Login>) -> Result<()> {
         let request = self.expect(tag::SESSION_KEY_REQUEST)?;
         let user = request.cursor().string()?;
-        let challenge = fresh_challenge(&self.peer);
+        let challenge = fresh_challenge();
         let mut key = Vec::new();
         key.counted(&challenge);
         self.send(tag::SESSION_KEY, key)?;
@@ -138,7 +148,11 @@ impl Session {
         self.user = reader.string()?;
         let offered = reader.counted()?;
         let accepted = expected.is_none_or(|login| {
-            self.user == login.user && offered == verifier(&challenge, login.password.as_bytes())
+            self.user == login.user
+                && codec::constant_time::equal(
+                    offered,
+                    &verifier(&challenge, login.password.as_bytes()),
+                )
         });
         if !accepted || self.user != user {
             let message = format!(
@@ -241,8 +255,8 @@ impl Session {
                 },
                 Event::Selected(sql.to_string()),
             ),
-            "INSERT" => {
-                let origin = format!("oracle://{}/{}", self.peer, table_of(sql));
+            "INSERT" if let Some((table, _, ())) = DIALECT.parse_insert(sql, bind_marker) => {
+                let origin = format!("oracle://{}/{table}", self.peer);
                 (
                     Answer::Complete(1),
                     Event::Inserted(Arrived::new(origin, bind.unwrap_or_default())),
@@ -322,34 +336,14 @@ fn service_name(connect_string: &str) -> String {
         .to_string()
 }
 
-/// The table an `INSERT INTO t (...) ...` names, or `?` where none is
-/// plain to read; only for the origin URI.
-fn table_of(sql: &str) -> String {
-    sql.split_whitespace()
-        .skip_while(|word| !word.eq_ignore_ascii_case("into"))
-        .nth(1)
-        .map_or_else(
-            || "?".to_string(),
-            |table| table.split('(').next().unwrap_or(table).to_string(),
-        )
+/// The one bind marker the INSERT carries, and what follows it.
+fn bind_marker(rest: &str) -> Option<((), &str)> {
+    rest.strip_prefix(BIND).map(|tail| ((), tail))
 }
 
-/// Sixteen bytes no two sessions share: the clock, the peer and a counter
-/// folded to a block.
-fn fresh_challenge(peer: &SocketAddr) -> [u8; 16] {
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    let seed = format!(
-        "{nanos}:{peer}:{}",
-        SESSIONS.fetch_add(1, Ordering::Relaxed)
-    );
-    let bytes = seed.into_bytes();
-    let mut block = [0u8; 16];
-    for (i, byte) in bytes.iter().enumerate() {
-        block[i % 16] = block[i % 16].wrapping_add(*byte).rotate_left(1);
-    }
-    block
+/// Sixteen random bytes: the challenge a login is verified against.
+fn fresh_challenge() -> [u8; 16] {
+    codec::random::array()
 }
 
 #[cfg(test)]
@@ -357,14 +351,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_challenge_is_sixteen_bytes_and_fresh_and_a_table_is_read_for_the_origin() {
-        let peer: SocketAddr = "127.0.0.1:1521".parse().expect("address");
-        let first = fresh_challenge(&peer);
+    fn a_challenge_is_sixteen_bytes_and_fresh_and_an_insert_is_read_for_the_origin() {
+        let first = fresh_challenge();
         assert_eq!(first.len(), 16);
-        SESSIONS.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(first, fresh_challenge(&peer));
-        assert_eq!(table_of("INSERT INTO inbox (payload) VALUES (:1)"), "inbox");
-        assert_eq!(table_of("INSERT INTO inbox(payload) VALUES (:1)"), "inbox");
-        assert_eq!(table_of("nonsense"), "?");
+        assert_ne!(first, fresh_challenge());
+        let table = |sql: &str| {
+            DIALECT
+                .parse_insert(sql, bind_marker)
+                .map(|(table, ..)| table)
+        };
+        assert_eq!(
+            table("INSERT INTO inbox(payload) VALUES (:1)").expect("bare"),
+            "inbox"
+        );
+        let quoted = DIALECT.insert("in\"box", "payload", BIND);
+        assert_eq!(table(&quoted).expect("quoted"), "in\"box");
+        assert!(table("INSERT INTO inbox (payload) VALUES ('x')").is_none());
     }
 }

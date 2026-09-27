@@ -10,28 +10,11 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use transport::error::{Result, TransportError, protocol_error};
-use transport::socket;
+use transport::pool::{Pooled, alive};
+use transport::{Login, socket};
 
 use crate::tns;
 use crate::ttc::{self, Message, Ttc, TtcWrite, tag};
-
-/// What a login presents.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Login {
-    pub user: String,
-    pub password: String,
-}
-
-impl Login {
-    /// A login for `user` with `password`.
-    #[must_use]
-    pub fn new(user: impl Into<String>, password: impl Into<String>) -> Self {
-        Self {
-            user: user.into(),
-            password: password.into(),
-        }
-    }
-}
 
 /// What a statement came back with.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -46,6 +29,8 @@ pub struct QueryResult {
 /// The banner this client names itself with in the protocol handshake.
 const BANNER: &str = "xmip-thin";
 
+/// One logged-in session, kept between statements while the listener
+/// keeps it open.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -188,6 +173,15 @@ impl Client {
         } else {
             Err(unexpected(&message))
         }
+    }
+}
+
+impl Pooled for Client {
+    /// While the listener has not closed the connection. What a statement
+    /// changed is committed before the session is kept, so none is left
+    /// open for the next.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
     }
 }
 

@@ -48,7 +48,7 @@ pub mod ttc;
 use std::net::TcpListener;
 use std::time::Duration;
 
-pub use client::{Client, Login, QueryResult, oracle_error};
+pub use client::{Client, QueryResult, oracle_error};
 pub use session::{Answer, Event, Session};
 use session::{BIND, DIALECT};
 use transport::claim::{NoNativeClaim, ResourceClaim};
@@ -56,11 +56,15 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Login, Pool, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
+
+/// What a send runs after its INSERT: a session kept between sends does
+/// not log off, and the logoff was what committed.
+const COMMIT: &str = "COMMIT";
 
 /// What the loopback pair agrees on: one service, one user whose login the
 /// far end takes as it comes, one table and column the payload is bound
@@ -76,6 +80,9 @@ pub struct OracleTransport {
     login: Login,
     query: String,
     timeout: Option<Duration>,
+    /// The sessions a send inserts on, logged in once per server and
+    /// service and kept.
+    sessions: Pool<Client>,
 }
 
 impl OracleTransport {
@@ -93,6 +100,7 @@ impl OracleTransport {
             login: Login::new(user, ""),
             query: DEFAULT_QUERY.to_string(),
             timeout: None,
+            sessions: Pool::new(),
         }
     }
 
@@ -182,12 +190,20 @@ impl Transport for OracleTransport {
         Ok(arrived)
     }
 
-    /// Insert the bytes as one bound RAW of one row.
+    /// Insert the bytes as one bound RAW of one row, and commit it, on the
+    /// session kept for the server and service, logged in on the first
+    /// send to them.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let to = DIALECT.destination(target, &self.server, &self.service)?;
-        let mut client = self.connect_to(to.server, to.catalog)?;
-        client.execute(&DIALECT.insert(to.table, to.column, BIND), Some(bytes))?;
-        client.close()
+        let insert = DIALECT.insert(to.table, to.column, BIND);
+        self.sessions.exchange(
+            &format!("{}/{}", to.server, to.catalog),
+            || self.connect_to(to.server, to.catalog),
+            |client| {
+                client.execute(&insert, Some(bytes))?;
+                client.execute(COMMIT, None).map(|_| ())
+            },
+        )
     }
 
     /// Rows are artefacts, and one receive holds no transaction to claim
@@ -265,9 +281,9 @@ impl Accepting for OracleTransport {
         let arrived = session
             .next_insert()?
             .ok_or_else(|| protocol_error("the client logged off without inserting"))?;
-        // Read the logoff that follows, so the goodbye is taken rather
-        // than written into a closed socket.
-        session.next_insert()?;
+        // Answer the COMMIT that follows; the client keeps its session for
+        // the next insert.
+        session.next_event()?;
         Ok(arrived)
     }
 }
@@ -415,7 +431,12 @@ mod tests {
         let first = session.next_insert().expect("insert").expect("one");
         assert_eq!(first.bytes, b"\0raw\xff");
         assert!(first.origin_uri.ends_with("/inbox"));
-        assert!(session.next_insert().expect("logoff").is_none());
+        assert_eq!(
+            session.next_event().expect("commit"),
+            Some(Event::Executed(COMMIT.into())),
+            "committed, since the session is kept rather than logged off"
+        );
+        drop(session);
         let wrong = far_end.accept_one(&listener).err().expect("wrong password");
         assert!(wrong.message.contains("ORA-01017"), "{wrong}");
         let nobody = far_end.accept_one(&listener).err().expect("wrong user");
@@ -434,6 +455,43 @@ mod tests {
                 .message
                 .contains("ORA-01017")
         );
+    }
+
+    #[test]
+    fn a_thousand_inserts_log_in_once_and_a_session_the_listener_closed_is_replaced() {
+        const SENDS: usize = 1000;
+        let far_end = OracleTransport::new("127.0.0.1:0", "ORDERS", "xmip")
+            .with_password("secret")
+            .timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let near = OracleTransport::new(address, "ORDERS", "xmip")
+            .with_password("secret")
+            .timing_out_after(secs(5));
+        let sending = near.clone();
+        let sender = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for n in 0..SENDS {
+                sending.send("inbox/payload", n.to_string().as_bytes())?;
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond an insert.
+            assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
+            sending.send("inbox/payload", b"after the close")
+        });
+        // One connect and O5LOGON for every insert: one session accepted.
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        for n in 0..SENDS {
+            let inserted = session.next_insert().expect("insert").expect("one");
+            assert_eq!(inserted.bytes, n.to_string().as_bytes());
+        }
+        session.next_event().expect("the last commit");
+        drop(session);
+        let mut again = far_end.accept_one(&listener).expect("a new login");
+        let last = again.next_insert().expect("insert").expect("one");
+        assert_eq!(last.bytes, b"after the close");
+        again.next_event().expect("its commit");
+        sender.join().expect("thread").expect("sending");
+        assert_eq!(near.sessions.opened(), 2);
     }
 
     #[test]

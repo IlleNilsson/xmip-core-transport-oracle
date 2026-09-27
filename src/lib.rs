@@ -9,8 +9,10 @@
 //! producer inserts, an integrator polls. A Receive Location runs its
 //! query — `SELECT id, payload FROM inbox ORDER BY id` unless told
 //! otherwise — and hands each row up; a Send Location inserts the Stream
-//! as one bound RAW of one row, `INSERT INTO <table> (<column>) VALUES
-//! (:1)`, so a byte is a byte both ways. What is spoken is Oracle Net
+//! as one bound RAW of one row, `INSERT INTO "<table>" ("<column>")
+//! VALUES (:1)`, so a byte is a byte both ways. The table and column are
+//! quoted identifiers, so a target names them exactly as the dictionary
+//! stores them: `INBOX/PAYLOAD` for a table created unquoted. What is spoken is Oracle Net
 //! (TNS) on port 1521 — the connect and its accept (`tns.rs`) — with the
 //! two-task common layer inside it (`ttc.rs`): a protocol and data-type
 //! negotiation, the O5LOGON session key and authentication, then a
@@ -48,8 +50,9 @@ use std::time::Duration;
 
 pub use client::{Client, Login, QueryResult, oracle_error};
 pub use session::{Answer, Event, Session};
+use session::{BIND, DIALECT};
 use transport::claim::{NoNativeClaim, ResourceClaim};
-use transport::error::{Result, TransportError, protocol_error};
+use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
@@ -143,25 +146,6 @@ impl OracleTransport {
     pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
         Session::accept(listener, Some(&self.login), self.timeout)
     }
-
-    /// Where a target names the server, service, table and column, or some
-    /// suffix of them on what this transport is configured with.
-    fn resolve<'a>(&'a self, target: &'a str) -> Result<(&'a str, &'a str, &'a str, &'a str)> {
-        let (server, path) = socket::target("oracle", target)
-            .or_else(|| match target.split_once('/') {
-                Some((peer, path)) if peer.contains(':') => Some((peer, path)),
-                _ => None,
-            })
-            .unwrap_or((&self.server, target));
-        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        match segments.as_slice() {
-            [service, table, column] => Ok((server, service, table, column)),
-            [table, column] => Ok((server, &self.service, table, column)),
-            _ => Err(TransportError::permanent(format!(
-                "{target:?} is not service/table/column or table/column"
-            ))),
-        }
-    }
 }
 
 /// A connect string a listener reads a service out of.
@@ -200,10 +184,9 @@ impl Transport for OracleTransport {
 
     /// Insert the bytes as one bound RAW of one row.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        let (server, service, table, column) = self.resolve(target)?;
-        let mut client = self.connect_to(server, service)?;
-        let sql = format!("INSERT INTO {table} ({column}) VALUES (:1)");
-        client.execute(&sql, Some(bytes))?;
+        let to = DIALECT.destination(target, &self.server, &self.service)?;
+        let mut client = self.connect_to(to.server, to.catalog)?;
+        client.execute(&DIALECT.insert(to.table, to.column, BIND), Some(bytes))?;
         client.close()
     }
 
@@ -308,6 +291,7 @@ impl Loopback for OracleTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::error::TransportError;
     use transport::payload::edge_payloads;
 
     fn secs(n: u64) -> Duration {

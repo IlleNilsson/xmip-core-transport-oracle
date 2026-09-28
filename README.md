@@ -13,6 +13,8 @@ keeps its case, so a target names a table as the dictionary stores it:
 
 A Send Location inserts on a session logged in once per server and service and kept (`transport::Pool`), and commits each insert, since the logoff that committed it no longer follows. The login is the transport capability's `Login`. Until 2026-09-27 every insert connected, negotiated and logged in.
 
+A Receive Location runs its query on a session kept the same way: logged in on its first receive and reused by every receive after, replaced where the listener closed it. Until 2026-09-28 every receive logged in and off.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it

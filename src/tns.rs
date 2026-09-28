@@ -14,11 +14,9 @@ pub const CONNECT: u8 = 1;
 /// `NSPTAC`, an accept.
 pub const ACCEPT: u8 = 2;
 /// `NSPTRF`, a refuse.
-pub const REFUSE: u8 = 4;
+const REFUSE: u8 = 4;
 /// `NSPTDA`, a data packet.
 pub const DATA: u8 = 6;
-/// `NSPTMK`, a marker.
-pub const MARKER: u8 = 12;
 
 /// The protocol version this crate offers and accepts.
 pub const VERSION: u16 = 318;
@@ -70,12 +68,9 @@ impl Packet {
     /// Where the connection broke mid-packet, or the packet is malformed
     /// or over [`MAX_PACKET`].
     pub fn read(reader: &mut impl Read) -> Result<Option<Self>> {
-        let mut head = [0u8; 8];
-        match reader.read_exact(&mut head) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(classify("reading a packet header", &e)),
-        }
+        let Some(head) = net::read::header::<8>(reader, "a packet header")? else {
+            return Ok(None);
+        };
         let length = u16::from_be_bytes([head[0], head[1]]) as usize;
         if !(8..=MAX_PACKET).contains(&length) {
             return Err(protocol_error(format!("a TNS packet of {length} bytes")));

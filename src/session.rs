@@ -35,9 +35,9 @@ pub const DIALECT: Dialect = Dialect {
 pub const BIND: &str = ":1";
 
 /// The number Oracle answers a refused login with (`ORA-01017`).
-pub const INVALID_CREDENTIAL: u32 = 1017;
+const INVALID_CREDENTIAL: u32 = 1017;
 /// The number it answers a statement it will not run (`ORA-00900`).
-pub const INVALID_STATEMENT: u32 = 900;
+const INVALID_STATEMENT: u32 = 900;
 /// What the far end names itself in the protocol handshake.
 pub const SERVER_BANNER: &str = "Oracle Database (xmip)";
 

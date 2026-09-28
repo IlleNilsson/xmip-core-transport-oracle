@@ -212,7 +212,7 @@ impl Message {
 
     /// The two-task payload: the tag, then the body.
     #[must_use]
-    pub fn to_payload(&self) -> Vec<u8> {
+    fn to_payload(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.body.len() + 1);
         out.push(self.tag);
         out.extend_from_slice(&self.body);
@@ -223,7 +223,7 @@ impl Message {
     ///
     /// # Errors
     /// Where the payload is empty.
-    pub fn from_payload(payload: &[u8]) -> Result<Self> {
+    fn from_payload(payload: &[u8]) -> Result<Self> {
         let (tag, body) = payload
             .split_first()
             .ok_or_else(|| protocol_error("an empty two-task payload"))?;

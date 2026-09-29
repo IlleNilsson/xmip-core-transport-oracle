@@ -5,7 +5,7 @@
 //! came from.
 //!
 //! Oracle is the database under the enterprise's oldest systems, and a
-//! table in one is an integration surface a partner already has: a
+//! table in one is an integration surface a Party already has: a
 //! producer inserts, an integrator polls. A Receive Location runs its
 //! query — `SELECT id, payload FROM inbox ORDER BY id` unless told
 //! otherwise — and hands each row up; a Send Location inserts the Stream

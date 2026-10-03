@@ -35,6 +35,21 @@
 //! hold it across the Stream's lifetime. The query itself — a status
 //! column, a `RETURNING` clause — is what keeps a row from arriving twice.
 //!
+//! **A row is consumed by the `accept` statement, after its cycle.** The
+//! query only reads. Where the Location declares `accept` — `DELETE FROM
+//! inbox WHERE id = :1` — it runs once a row's cycle accepted or refused
+//! it, the row's name bound in place of `:1` (`transport::sql::accept`),
+//! written as a string literal by the dialect's string quoting (`'…'`, a
+//! quote doubled): a table has no place for a refused row, the runtime
+//! audited the refusal, and from Message creation on the Stream is kept in
+//! Xmip (ADR-0013). A row whose cycle failed is
+//! left, and the next receive reads it again; so is a row whose name is
+//! NULL, which no statement can name. Where `accept` is left out a row's
+//! verdict tells the database nothing: every row is read again unless the
+//! query keeps it from that.
+//! A query that consumes as it reads — a `DELETE … RETURNING` — consumes before the
+//! receive cycle has run, so acceptance is at-most-once under such a query.
+//!
 //! The origin URI carries what the row knew: `oracle://server/service
 //! ?row=41`. A send target is `oracle://host:1521/<service>/<table>
 //! /<column>`, `host:1521/<service>/<table>/<column>`, or
@@ -46,17 +61,20 @@ pub mod tns;
 pub mod ttc;
 
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use client::{Client, QueryResult, oracle_error};
+use codec::sql::Delimiter;
+use session::DIALECT;
 pub use session::{Answer, Event, Session};
-use session::{BIND, DIALECT};
 use transport::claim::{NoNativeClaim, ResourceClaim};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Login, Pool, Transport};
+use transport::sql::accept;
+use transport::{Arrived, Configured, Directions, Login, Pool, Taken, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// What a Receive Location runs unless told otherwise.
@@ -79,6 +97,8 @@ pub struct OracleTransport {
     service: String,
     login: Login,
     query: String,
+    /// The statement run on a row's verdict, its name bound in.
+    accept: Option<String>,
     timeout: Option<Duration>,
     /// The sessions a send inserts on and a receive queries on, logged
     /// in once per server and service and kept.
@@ -99,6 +119,7 @@ impl OracleTransport {
             service: service.into(),
             login: Login::new(user, ""),
             query: DEFAULT_QUERY.to_string(),
+            accept: None,
             timeout: None,
             sessions: Pool::new(),
         }
@@ -116,6 +137,15 @@ impl OracleTransport {
     #[must_use]
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = query.into();
+        self
+    }
+
+    /// The statement run once a row's cycle accepted or refused it, the
+    /// row's name in place of the dialect's first parameter
+    /// (`transport::sql::accept`).
+    #[must_use]
+    pub fn with_accept(mut self, statement: impl Into<String>) -> Self {
+        self.accept = Some(statement.into());
         self
     }
 
@@ -170,27 +200,44 @@ impl Transport for OracleTransport {
         Directions::BOTH
     }
 
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("a poll reads again what is not yet told")
+    }
+
     /// Run the query on the session kept for the server and service,
-    /// logged in on the first receive; each row is a Stream.
+    /// logged in on the first receive; each row is a Stream, whole. Its
+    /// verdict runs the `accept` statement where one is declared — on
+    /// `Accepted` and `Refused`, never on `Failed` — and tells the database
+    /// nothing where none is: whether a row is read again is then the
+    /// query's (a query that consumes as it reads makes acceptance
+    /// at-most-once).
     fn receive(&self) -> Result<Vec<Arrived>> {
         let result = self.sessions.exchange(
             &format!("{}/{}", self.server, self.service),
             || self.connect(),
             |client| client.query(&self.query, None),
         )?;
-        let mut arrived = Vec::with_capacity(result.rows.len());
-        for (index, row) in result.rows.into_iter().enumerate() {
-            let name = row.first().and_then(|value| value.as_ref()).map_or_else(
-                || index.to_string(),
-                |bytes| String::from_utf8_lossy(bytes).into_owned(),
-            );
-            let value = row.into_iter().next_back().flatten().unwrap_or_default();
-            arrived.push(Arrived::new(
-                format!("oracle://{}/{}?row={name}", self.server, self.service),
-                value,
-            ));
-        }
-        Ok(arrived)
+        let shared = Arc::new(self.clone());
+        accept::arrivals(
+            result.rows,
+            |name| format!("oracle://{}/{}?row={name}", self.server, self.service),
+            |bytes| String::from_utf8_lossy(bytes).into_owned(),
+            Ok,
+            |name| {
+                let transport = Arc::clone(&shared);
+                let quote = |name: &str| Delimiter::STRING.quote(name);
+                DIALECT.accepting(self.accept.as_deref(), name, quote, move |sql| {
+                    transport.sessions.exchange(
+                        &format!("{}/{}", transport.server, transport.service),
+                        || transport.connect(),
+                        |client| {
+                            client.execute(sql, None)?;
+                            client.execute(COMMIT, None).map(|_| ())
+                        },
+                    )
+                })
+            },
+        )
     }
 
     /// Insert the bytes as one bound RAW of one row, and commit it, on the
@@ -198,7 +245,7 @@ impl Transport for OracleTransport {
     /// send to them.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let to = DIALECT.destination(target, &self.server, &self.service)?;
-        let insert = DIALECT.insert(to.table, to.column, BIND);
+        let insert = DIALECT.insert(to.table, to.column, DIALECT.marker);
         self.sessions.exchange(
             &format!("{}/{}", to.server, to.catalog),
             || self.connect_to(to.server, to.catalog),
@@ -244,6 +291,7 @@ impl Configured for OracleTransport {
                           is the Stream.",
                 applies: Applies::Receive,
             },
+            accept::ACCEPT,
             Setting {
                 name: "timeout",
                 kind: Kind::Duration,
@@ -262,6 +310,9 @@ impl Configured for OracleTransport {
         if let Some(query) = settings.optional_text("query") {
             transport = transport.with_query(query);
         }
+        if let Some(statement) = settings.optional_text(accept::ACCEPT.name) {
+            transport = transport.with_accept(statement);
+        }
         if let Some(timeout) = settings.optional_duration("timeout") {
             transport = transport.timing_out_after(timeout);
         }
@@ -279,7 +330,7 @@ impl OracleTransport {
 }
 
 impl Accepting for OracleTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         let mut session = self.accept_one(listener)?;
         let arrived = session
             .next_insert()?
@@ -364,6 +415,72 @@ mod tests {
         }
     }
 
+    /// The first of `arrived` read and refused, the rest taken.
+    fn verdicts(arrived: Vec<Arrived>) -> Result<Vec<Taken>> {
+        let mut taken = Vec::new();
+        for (index, one) in arrived.into_iter().enumerate() {
+            assert!(one.defers());
+            if index > 0 {
+                taken.push(one.taken()?);
+                continue;
+            }
+            let (origin, mut body, acknowledgement) = one.into_parts();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut body, &mut bytes).expect("reading");
+            acknowledgement.acknowledge(transport::Verdict::Failed)?;
+            taken.push(Taken::new(origin, bytes));
+        }
+        Ok(taken)
+    }
+
+    #[test]
+    fn the_accept_statement_consumes_an_accepted_and_a_refused_row_after_the_cycle() {
+        let far_end =
+            OracleTransport::new("127.0.0.1:0", "ORDERS", "xmip").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiver = std::thread::spawn(move || {
+            let near = OracleTransport::new(address, "ORDERS", "xmip")
+                .with_accept("DELETE FROM inbox WHERE id = :1")
+                .timing_out_after(secs(2));
+            let mut arrived = near.receive()?;
+            assert_eq!(arrived.len(), 4);
+            arrived.remove(0).taken()?;
+            arrived
+                .remove(0)
+                .refused(transport::Refusal::Unacceptable)?;
+            arrived.remove(0).failed()?;
+            arrived.remove(0).taken()?;
+            Ok::<_, TransportError>(())
+        });
+        let rows: [&[Option<&[u8]>]; 4] = [
+            &[Some(b"41"), Some(b"a")],
+            &[Some(b"it's"), Some(b"b")],
+            &[Some(b"43"), Some(b"c")],
+            &[None, Some(b"d")],
+        ];
+        let mut session = far_end
+            .accept_one(&listener)
+            .expect("accepting")
+            .with_table(&["id", "payload"], &rows)
+            .answering(|sql| sql.starts_with("DELETE").then_some(Answer::Complete(1)));
+        let mut events = Vec::new();
+        while let Some(event) = session.next_event().expect("serving") {
+            events.push(event);
+        }
+        receiver.join().expect("thread").expect("receiving");
+        assert_eq!(
+            events,
+            [
+                Event::Selected(DEFAULT_QUERY.into()),
+                Event::Executed("DELETE FROM inbox WHERE id = '41'".into()),
+                Event::Executed(COMMIT.into()),
+                Event::Executed("DELETE FROM inbox WHERE id = 'it''s'".into()),
+                Event::Executed(COMMIT.into()),
+            ],
+            "the failed row and the unnamed one are left"
+        );
+    }
+
     #[test]
     fn a_receive_runs_the_query_and_each_row_is_a_stream() {
         let far_end = OracleTransport::new("127.0.0.1:0", "ORDERS", "xmip")
@@ -371,11 +488,11 @@ mod tests {
             .timing_out_after(secs(2));
         let (listener, address) = far_end.bind().expect("binding");
         let receiver = std::thread::spawn(move || {
-            OracleTransport::new(address, "ORDERS", "xmip")
+            let near = OracleTransport::new(address, "ORDERS", "xmip")
                 .with_password("secret")
                 .with_query("SELECT id, kind, payload FROM inbox ORDER BY id")
-                .timing_out_after(secs(2))
-                .receive()
+                .timing_out_after(secs(2));
+            verdicts(near.receive()?)
         });
         let mut session = far_end
             .accept_one(&listener)
@@ -395,7 +512,10 @@ mod tests {
             event,
             Event::Selected("SELECT id, kind, payload FROM inbox ORDER BY id".into())
         );
-        assert!(session.next_event().expect("logoff").is_none());
+        assert!(
+            session.next_event().expect("ended").is_none(),
+            "a verdict, refused or accepted, says nothing to the database"
+        );
         let arrived = receiver.join().expect("thread").expect("receiving");
         assert_eq!(arrived.len(), 3);
         assert_eq!(arrived[0].bytes, b"ISA*00*");

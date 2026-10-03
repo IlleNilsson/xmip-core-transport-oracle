@@ -16,7 +16,7 @@ use std::time::Duration;
 use codec::sql::Delimiter;
 use transport::error::{Result, TransportError, protocol_error};
 use transport::sql::{self, Answering, Dialect, Inserted, Rows};
-use transport::{Arrived, Login, socket};
+use transport::{Login, Taken, socket};
 
 use crate::tns;
 use crate::ttc::{self, Message, Ttc, TtcWrite, tag, verifier};
@@ -29,10 +29,8 @@ pub const DIALECT: Dialect = Dialect {
     catalog: "service",
     identifier: Delimiter::IDENTIFIER,
     bare: &['_', '.', '$', '#'],
+    marker: ":1",
 };
-
-/// The bind marker the one INSERT carries its RAW in.
-pub const BIND: &str = ":1";
 
 /// The number Oracle answers a refused login with (`ORA-01017`).
 const INVALID_CREDENTIAL: u32 = 1017;
@@ -47,13 +45,13 @@ pub enum Event {
     /// The client ran a SELECT; here it is.
     Selected(String),
     /// The client inserted one bound value; here is the Stream.
-    Inserted(Arrived),
+    Inserted(Taken),
     /// The client ran something else; here it is.
     Executed(String),
 }
 
 impl Inserted for Event {
-    fn inserted(self) -> Option<Arrived> {
+    fn inserted(self) -> Option<Taken> {
         match self {
             Self::Inserted(arrived) => Some(arrived),
             Self::Selected(_) | Self::Executed(_) => None,
@@ -197,7 +195,7 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_insert(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_insert(&mut self) -> Result<Option<Taken>> {
         sql::next_insert(|| self.next_event())
     }
 
@@ -257,7 +255,7 @@ impl Session {
                 let origin = format!("oracle://{}/{table}", self.peer);
                 (
                     Answer::Complete(1),
-                    Event::Inserted(Arrived::new(origin, bind.unwrap_or_default())),
+                    Event::Inserted(Taken::new(origin, bind.unwrap_or_default())),
                 )
             }
             // What a client that keeps its session commits with, where a
@@ -340,7 +338,7 @@ fn service_name(connect_string: &str) -> String {
 
 /// The one bind marker the INSERT carries, and what follows it.
 fn bind_marker(rest: &str) -> Option<((), &str)> {
-    rest.strip_prefix(BIND).map(|tail| ((), tail))
+    rest.strip_prefix(DIALECT.marker).map(|tail| ((), tail))
 }
 
 /// Sixteen random bytes: the challenge a login is verified against.
@@ -366,7 +364,7 @@ mod tests {
             table("INSERT INTO inbox(payload) VALUES (:1)").expect("bare"),
             "inbox"
         );
-        let quoted = DIALECT.insert("in\"box", "payload", BIND);
+        let quoted = DIALECT.insert("in\"box", "payload", DIALECT.marker);
         assert_eq!(table(&quoted).expect("quoted"), "in\"box");
         assert!(table("INSERT INTO inbox (payload) VALUES ('x')").is_none());
     }

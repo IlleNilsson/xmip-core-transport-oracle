@@ -66,6 +66,7 @@ pub use client::{Client, QueryResult, oracle_error};
 use codec::sql::Delimiter;
 use session::DIALECT;
 pub use session::{Answer, Event, Session};
+use transport::ArrivalIdentity;
 use transport::claim::{NoNativeClaim, ResourceClaim};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
@@ -345,6 +346,12 @@ impl Accepting for OracleTransport {
 }
 
 impl Loopback for OracleTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "a row names no sender: the database it was read from is in its origin",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }

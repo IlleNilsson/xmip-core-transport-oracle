@@ -1,9 +1,9 @@
-//! Xmip's side of one connection to an Oracle listener: the TNS connect
-//! and its accept, the protocol and data-type negotiation, the O5LOGON
-//! session key and authentication, then a statement executed with a bind
-//! and its rows fetched. The text of a query is what a Receive Location
-//! configured; a Send Location runs one `INSERT ... VALUES (:1)` with the
-//! Stream bound as one RAW.
+//! Xmip's side of one connection, in this crate's wire (`tns.rs`,
+//! `ttc.rs`): the connect and its accept, the protocol and data-type
+//! exchange, the challenge and its answer, then a statement executed and
+//! its rows fetched, each value text. The text of a query is what a
+//! Receive Location configured; a Send Location runs one INSERT of one
+//! literal, written in Oracle's dialect (`sql::ORACLE`).
 
 use std::io::BufReader;
 use std::net::TcpStream;
@@ -20,8 +20,8 @@ use crate::ttc::{self, Message, Ttc, TtcWrite, tag};
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct QueryResult {
     pub columns: Vec<String>,
-    /// Each row, each column its bytes or NULL.
-    pub rows: Vec<Vec<Option<Vec<u8>>>>,
+    /// Each row, each column its text or NULL.
+    pub rows: Vec<Vec<Option<String>>>,
     /// What a statement without rows reported.
     pub affected_rows: u64,
 }
@@ -106,14 +106,14 @@ impl Client {
         &self.banner
     }
 
-    /// Run `sql`, binding `bind` where there is one, and take its rows.
+    /// Run `sql` and take its rows.
     ///
     /// # Errors
-    /// Where the server went away or answered with an error.
-    pub fn query(&mut self, sql: &str, bind: Option<&[u8]>) -> Result<QueryResult> {
+    /// Where the server went away, answered with an error, or answered a
+    /// value that is not UTF-8.
+    pub fn query(&mut self, sql: &str) -> Result<QueryResult> {
         let mut body = Vec::new();
         body.string(sql);
-        body.value(bind);
         self.send(tag::EXECUTE, body)?;
         let mut result = QueryResult::default();
         loop {
@@ -138,12 +138,12 @@ impl Client {
         }
     }
 
-    /// Run `sql` for its effect, binding `bind`; the rows it touched.
+    /// Run `sql` for its effect; the rows it touched.
     ///
     /// # Errors
     /// Where the server went away or answered with an error.
-    pub fn execute(&mut self, sql: &str, bind: Option<&[u8]>) -> Result<u64> {
-        self.query(sql, bind).map(|result| result.affected_rows)
+    pub fn execute(&mut self, sql: &str) -> Result<u64> {
+        self.query(sql).map(|result| result.affected_rows)
     }
 
     /// Log off and hang up.
@@ -185,11 +185,22 @@ impl Pooled for Client {
     }
 }
 
-/// The `(name, value)` of a row's columns.
-fn read_row(message: &Message) -> Result<Vec<Option<Vec<u8>>>> {
+/// A row's values, each its text or NULL; a value that is not UTF-8 is
+/// refused, never repaired.
+fn read_row(message: &Message) -> Result<Vec<Option<String>>> {
     let mut reader = message.cursor();
-    let count = usize::from(reader.u16_be()?);
-    (0..count).map(|_| reader.value()).collect()
+    let count = reader.count()?;
+    (0..count)
+        .map(|_| {
+            reader
+                .value()?
+                .map(String::from_utf8)
+                .transpose()
+                .map_err(|_| {
+                    protocol_error("a row value that is not UTF-8; a RAW is read as RAWTOHEX(…)")
+                })
+        })
+        .collect()
 }
 
 /// The error an error message carries; `ORA-00600` and class say whether

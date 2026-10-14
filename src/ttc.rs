@@ -1,24 +1,22 @@
-//! The two-task common layer (TTC), the function messages Oracle carries
-//! inside TNS data packets. A real thin client speaks these as
-//! python-oracledb's thin mode documents them: a protocol handshake, a
-//! data-type negotiation, the O5LOGON key exchange and authentication,
-//! then the OPI functions that open a cursor, execute a statement with a
-//! bind and fetch rows.
+//! The messages this crate carries inside its data packets, in the order
+//! of Oracle's two-task common layer (TTC): a protocol exchange, a
+//! data-type exchange, a challenge and its answer, then a statement
+//! executed and its rows fetched.
 //!
-//! What is encoded here is that shape — a message tag and its fields —
-//! carried faithfully as messages in order, with each string and each
-//! opaque value counted. The O5LOGON verifier a real server checks is an
-//! AES key schedule over the password (11g/12c); that computation is the
-//! identity capability's, per ADR-0044, so the verifier is stood in by a
-//! session-key mix this crate's own listener checks. TLS is the transport
-//! capability's, per ADR-0033. A Stream binds as one RAW value and comes
-//! back as one column, so a byte is a byte both ways.
+//! It is the order and not the encoding: Oracle's own TTC — its function
+//! codes, its capability vectors, its O5LOGON key exchange with the 11g
+//! (SHA-1, AES-192) or 12c (PBKDF2 over SHA-512, AES-256) verifier — is
+//! not written here, so a real Oracle listener refuses this client and an
+//! Oracle client refuses this far end. Here a tag and counted fields carry
+//! each message, and the answer to the challenge is a keyed mix of the
+//! password that only this crate's own far end checks ([`verifier`]).
 
 use std::io::{Read, Write};
 
 use codec::cursor::Cursor;
 use codec::writer::ByteWriter;
-use transport::error::{Result, protocol_error};
+use net::ceiling;
+use transport::error::{Result, classify, protocol_error};
 
 use crate::tns;
 
@@ -30,11 +28,11 @@ pub mod tag {
     pub const PROTOCOL: u8 = 0x01;
     /// The data-type negotiation, taken as agreed.
     pub const DATA_TYPES: u8 = 0x02;
-    /// The client asks for a session key for `user` (O5LOGON `OSESSKEY`).
+    /// The client asks for a challenge for `user`.
     pub const SESSION_KEY_REQUEST: u8 = 0x03;
-    /// The server answers with the key (the auth challenge).
+    /// The server answers with the challenge.
     pub const SESSION_KEY: u8 = 0x04;
-    /// The client authenticates with the verifier (O5LOGON `OAUTH`).
+    /// The client answers the challenge.
     pub const AUTHENTICATE: u8 = 0x05;
     /// The server accepts the login.
     pub const AUTH_ACCEPTED: u8 = 0x06;
@@ -54,7 +52,13 @@ pub mod tag {
 
 /// Reading TTC's own fields off codec's cursor.
 pub trait Ttc<'a> {
-    /// Counted opaque bytes: a big-endian two-byte length, then the bytes.
+    /// A count or length: four bytes, big-endian.
+    ///
+    /// # Errors
+    /// Where the body ends first.
+    fn count(&mut self) -> Result<usize>;
+
+    /// Counted opaque bytes: a count, then the bytes.
     ///
     /// # Errors
     /// Where the body ends first.
@@ -78,7 +82,7 @@ pub trait Ttc<'a> {
     /// Where the body ends first or the count is not eight.
     fn long(&mut self) -> Result<u64>;
 
-    /// A two-byte count, then that many counted values.
+    /// A count, then that many counted values.
     ///
     /// # Errors
     /// Where the body ends first.
@@ -92,8 +96,12 @@ pub trait Ttc<'a> {
 }
 
 impl<'a> Ttc<'a> for Cursor<'a> {
+    fn count(&mut self) -> Result<usize> {
+        Ok(self.u32_be()? as usize)
+    }
+
     fn counted(&mut self) -> Result<&'a [u8]> {
-        let length = usize::from(self.u16_be()?);
+        let length = self.count()?;
         Ok(self.take(length)?)
     }
 
@@ -118,7 +126,7 @@ impl<'a> Ttc<'a> for Cursor<'a> {
     }
 
     fn values(&mut self) -> Result<Vec<Vec<u8>>> {
-        let count = usize::from(self.u16_be()?);
+        let count = self.count()?;
         (0..count)
             .map(|_| self.counted().map(<[u8]>::to_vec))
             .collect()
@@ -134,7 +142,8 @@ impl<'a> Ttc<'a> for Cursor<'a> {
 
 /// Writing TTC's own fields beside codec's [`ByteWriter`].
 pub trait TtcWrite {
-    /// A count or length: two bytes, big-endian, saturating.
+    /// A count or length: four bytes, big-endian, saturating; a message
+    /// is held under `net::MAX_BODY` long before.
     fn count(&mut self, count: usize) -> &mut Self;
 
     /// Counted opaque bytes.
@@ -152,7 +161,7 @@ pub trait TtcWrite {
 
 impl TtcWrite for Vec<u8> {
     fn count(&mut self, count: usize) -> &mut Self {
-        self.u16_be(u16::try_from(count).unwrap_or(u16::MAX))
+        self.u32_be(u32::try_from(count).unwrap_or(u32::MAX))
     }
 
     fn counted(&mut self, bytes: &[u8]) -> &mut Self {
@@ -171,10 +180,9 @@ impl TtcWrite for Vec<u8> {
     }
 }
 
-/// The O5LOGON verifier, stood in (see the module doc): the sixteen-byte
-/// answer to `challenge` for `password`, a keyed mix a real client would
-/// instead derive with AES. Deterministic, so this crate's own listener
-/// checks it, and never the empty answer for a non-empty password.
+/// The sixteen-byte answer to `challenge` for `password`: a keyed mix,
+/// not O5LOGON (see the module doc). Deterministic, so this crate's own
+/// far end checks it, and never the empty answer for a non-empty password.
 #[must_use]
 pub fn verifier(challenge: &[u8; 16], password: &[u8]) -> [u8; 16] {
     let mut state = *challenge;
@@ -240,29 +248,62 @@ impl Message {
     }
 }
 
-/// Write `message` as one TNS data packet.
+/// What one data packet carries of a message: the largest packet less its
+/// header and its data flag.
+const CHUNK: usize = tns::MAX_PACKET - 10;
+
+/// Write `message` as data packets: its length in four bytes, then its
+/// tag and body, cut where a packet is full, all written at once.
 ///
 /// # Errors
-/// Where the connection broke.
+/// Where the message is over what Xmip reads in one message
+/// (`net::MAX_BODY`), or the connection broke.
 pub fn write_message(writer: &mut impl Write, message: &Message) -> Result<()> {
-    tns::data(&message.to_payload()).write(writer)
+    let payload = message.to_payload();
+    ceiling::within(payload.len(), net::MAX_BODY, "Xmip reads in one message")?;
+    let length = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    let mut framed = length.to_be_bytes().to_vec();
+    framed.extend_from_slice(&payload);
+    let mut wire = Vec::with_capacity(framed.len() + framed.len() / CHUNK * 10 + 10);
+    for chunk in framed.chunks(CHUNK) {
+        wire.extend_from_slice(&tns::data(chunk).to_bytes());
+    }
+    writer
+        .write_all(&wire)
+        .and_then(|()| writer.flush())
+        .map_err(|e| classify("writing a message", &e))
 }
 
-/// Read one TTC message off a TNS data packet; `None` where the peer sent
-/// the end-of-file data flag (a logoff) or closed the connection.
+/// Read one message off as many data packets as it takes; `None` where
+/// the peer sent the end-of-file data flag (a logoff) or closed the
+/// connection before one began.
 ///
 /// # Errors
-/// Where the connection broke, a non-data packet arrived, or the payload
-/// was empty.
+/// Where the connection broke, a non-data packet arrived, the length is
+/// over `net::MAX_BODY`, or the payload was empty.
 pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>> {
     let Some(packet) = tns::Packet::read(reader)? else {
         return Ok(None);
     };
-    let (flag, payload) = tns::read_data(&packet)?;
+    let (flag, first) = tns::read_data(&packet)?;
     if flag == tns::DATA_FLAG_EOF {
         return Ok(None);
     }
-    Message::from_payload(payload).map(Some)
+    let (length, first) = first
+        .split_first_chunk::<4>()
+        .ok_or_else(|| protocol_error("a message shorter than its length"))?;
+    let length = u32::from_be_bytes(*length) as usize;
+    ceiling::within(length, net::MAX_BODY, "Xmip reads in one message")?;
+    let mut payload = Vec::with_capacity(length);
+    payload.extend_from_slice(first);
+    while payload.len() < length {
+        let packet = tns::Packet::expect(reader)?;
+        payload.extend_from_slice(tns::read_data(&packet)?.1);
+    }
+    if payload.len() != length {
+        return Err(protocol_error("a message longer than its length"));
+    }
+    Message::from_payload(&payload).map(Some)
 }
 
 /// Read one TTC message, which must be there.
@@ -313,11 +354,45 @@ mod tests {
         );
         assert_eq!(reader.value().expect("value"), Some(b"x".to_vec()));
         assert_eq!(reader.value().expect("null"), None);
-        let error = Cursor::new(&[0, 5, 1]).counted().expect_err("cut short");
+        let error = Cursor::new(&[0, 0, 0, 5, 1])
+            .counted()
+            .expect_err("cut short");
         assert!(!error.retryable);
         assert!(error.message.contains("runs past"), "{error}");
-        assert!(Cursor::new(&[0, 1, 7]).integer().is_err(), "not four bytes");
+        assert!(
+            Cursor::new(&[0, 0, 0, 1, 7]).integer().is_err(),
+            "not four bytes"
+        );
         assert!(Cursor::new(&[]).byte().is_err());
+    }
+
+    #[test]
+    fn a_message_over_a_packet_is_cut_into_packets_and_joined_whole() {
+        let body: Vec<u8> = (0..3 * tns::MAX_PACKET)
+            .map(|n| u8::try_from(n % 251).expect("under 251"))
+            .collect();
+        let large = Message {
+            tag: tag::EXECUTE,
+            body,
+        };
+        let mut wire = Vec::new();
+        write_message(&mut wire, &large).expect("written");
+        write_message(&mut wire, &Message::bare(tag::LOGOFF)).expect("written");
+        tns::data_eof().write(&mut wire).expect("written");
+        let mut reader = &wire[..];
+        assert_eq!(read_message(&mut reader).expect("large"), Some(large));
+        let bare = read_message(&mut reader).expect("bare").expect("one");
+        assert_eq!(bare.tag, tag::LOGOFF);
+        assert_eq!(read_message(&mut reader).expect("eof"), None);
+        let mut over = u32::try_from(net::MAX_BODY + 1)
+            .expect("fits")
+            .to_be_bytes()
+            .to_vec();
+        over.push(tag::EXECUTE);
+        let mut wire = Vec::new();
+        tns::data(&over).write(&mut wire).expect("written");
+        let refused = read_message(&mut &wire[..]).expect_err("over the ceiling");
+        assert!(refused.message.contains("over the"), "{refused}");
     }
 
     #[test]

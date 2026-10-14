@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/IlleNilsson/xmip-core-transport-oracle"
-description = "Oracle transport: one row of a query is one Stream, a send is one INSERT; TNS and TTC against a listener, as mssql and mysql are built. A xmip-core-transport technology."
+description = "Oracle Database transport: one row of a query is one Stream, a send is one INSERT; TNS and the two-task layer's order against a listener, in the Oracle dialect of xmip-core-library-sql. A xmip-core-transport technology."
 publish = false
 
 [lib]
@@ -22,8 +22,13 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 xcore = { package = "xmip-core", git = "https://github.com/IlleNilsson/xmip-core", branch = "main" }
 # The estate's encoding primitives: the byte cursor and writer TTC is read and written over.
 codec = { package = "xmip-core-library-codec", git = "https://github.com/IlleNilsson/xmip-core-library-codec", branch = "main" }
-# A packet header read whole, or nothing at a clean close (`net::read::header`).
-net = { package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
+# SQL: the Oracle dialect this transport speaks — its literals, its binary
+# form, the INSERT a send writes and a far end takes apart, and a
+# statement's verb.
+sql = { package = "xmip-core-library-sql", git = "https://github.com/IlleNilsson/xmip-core-library-sql", branch = "main" }
+# A packet header read whole, or nothing at a clean close
+# (`net::read::header`), and the most a message is read for (`net::MAX_BODY`).
+net ={ package = "xmip-core-library-net", git = "https://github.com/IlleNilsson/xmip-core-library-net", branch = "main" }
 
 [dev-dependencies]
 # The loopback payloads the tests drive, from the capability's test

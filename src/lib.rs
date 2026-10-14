@@ -4,49 +4,51 @@
 //! a configured query is what Xmip carries, the first column is where it
 //! came from.
 //!
-//! Oracle is the database under the enterprise's oldest systems, and a
-//! table in one is an integration surface a Party already has: a
+//! Oracle Database is the database under the enterprise's oldest systems,
+//! and a table in one is an integration surface a Party already has: a
 //! producer inserts, an integrator polls. A Receive Location runs its
 //! query — `SELECT id, payload FROM inbox ORDER BY id` unless told
 //! otherwise — and hands each row up; a Send Location inserts the Stream
-//! as one bound RAW of one row, `INSERT INTO "<table>" ("<column>")
-//! VALUES (:1)`, so a byte is a byte both ways. The table and column are
-//! quoted identifiers, so a target names them exactly as the dictionary
-//! stores them: `INBOX/PAYLOAD` for a table created unquoted. What is spoken is Oracle Net
-//! (TNS) on port 1521 — the connect and its accept (`tns.rs`) — with the
-//! two-task common layer inside it (`ttc.rs`): a protocol and data-type
-//! negotiation, the O5LOGON session key and authentication, then a
-//! statement executed with a bind and its rows fetched, as
-//! python-oracledb's thin mode speaks them. `client.rs` is Xmip's side;
-//! `session.rs` is the listener a test or the loopback pair puts on the
-//! far end.
+//! as one column of one row. What the column holds is the Location's to
+//! declare, never the bytes' (ADR-0038): `column = "binary"`, the default,
+//! inserts every Stream as `HEXTORAW('…')` and reads a value back from the
+//! bare hex `RAWTOHEX(…)` answers; `column = "text"` decodes the Stream
+//! strictly in its `encoding` — `utf-8` unless another Unicode form is
+//! named — inserts it as a string literal, and encodes a value read back
+//! to that form. A Stream that is not its declared form is refused, never
+//! repaired; so is a row value that is not UTF-8. The SQL is Oracle's as
+//! `xmip-core-library-sql` writes it (`sql::ORACLE`).
 //!
-//! The O5LOGON verifier a real 11g or 12c server checks is an AES key
-//! schedule over the password; that computation belongs to the identity
-//! capability (ADR-0044), so this crate stands it in with a session-key
-//! mix its own listener checks, the way TLS is deferred to the transport
-//! capability (ADR-0033). A server that demands the real verifier or TLS
-//! refuses the login, and this transport says so.
+//! Oracle is a transport here and nothing more: no Storage server speaks
+//! it (the owner, 2026-10-14).
+//!
+//! **The wire is this crate's own, not yet Oracle's.** A session goes as
+//! Oracle Net goes — a TNS connect and its accept (`tns.rs`), then the
+//! two-task layer's order inside data packets (`ttc.rs`): a protocol and a
+//! data-type exchange, a challenge and its answer, a statement executed
+//! and its rows fetched — but the bodies are not Oracle's: no TTC function
+//! codes, no O5LOGON with the 11g or 12c verifier. A real Oracle listener
+//! refuses this client, and this transport speaks only to the far end it
+//! carries (`session.rs`), which the loopback pair and the tests drive.
+//! TCPS is not spoken; where it is, it is `xmip-core-library-tls`'s
+//! (ADR-0033).
 //!
 //! Rows are artefacts and this transport claims none of them, per
-//! ADR-0024: the atomic claim a database has, `SELECT ... FOR UPDATE SKIP
-//! LOCKED`, holds only inside a transaction, and the flow here opens and
-//! closes its connection inside one receive, so there is no transaction to
-//! hold it across the Stream's lifetime. The query itself — a status
-//! column, a `RETURNING` clause — is what keeps a row from arriving twice.
+//! ADR-0024: the atomic claim a database has, `SELECT … FOR UPDATE SKIP
+//! LOCKED`, holds only inside a transaction, and none is held across a
+//! Stream's lifetime. The query itself — a status column — is what keeps a
+//! row from arriving twice.
 //!
-//! **A row is consumed by the `accept` statement, after its cycle.** The query
-//! only reads. Where the Location declares `accept` — `DELETE FROM inbox WHERE
-//! id = :1` — it runs once a row's cycle accepted it, the row's name bound in
-//! place of `:1` (`transport::sql::accept`), written as a string literal by the
-//! dialect's string quoting (`'…'`, a quote doubled). A refused row is left
-//! where it lies, and not received again while its body is unchanged. A row
-//! whose cycle failed is left, and the next receive reads it again; so is a row
-//! whose name is NULL, which no statement can name. Where `accept` is left out
-//! a row's verdict tells the database nothing: every row is read again unless
-//! the query keeps it from that. A query that consumes as it reads — a `DELETE
-//! … RETURNING` — consumes before the receive cycle has run, so acceptance is
-//! at-most-once under such a query.
+//! **A row is consumed by the `accept` statement, after its cycle.** The
+//! query only reads. Where the Location declares `accept` — `DELETE FROM
+//! inbox WHERE id = :1` — it runs once a row's cycle accepted it, the
+//! row's name bound in place of `:1` as Oracle's string literal
+//! (`transport::sql::accept`), and is committed. A refused row is left
+//! where it lies, and not received again while its body is unchanged. A
+//! row whose cycle failed is left, and the next receive reads it again; so
+//! is a row whose name is NULL, which no statement can name. Where
+//! `accept` is left out a row's verdict tells the database nothing: every
+//! row is read again unless the query keeps it from that.
 //!
 //! The origin URI carries what the row knew: `oracle://server/service
 //! ?row=41`. A send target is `oracle://host:1521/<service>/<table>
@@ -63,29 +65,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use client::{Client, QueryResult, oracle_error};
-use codec::sql::Delimiter;
-use session::DIALECT;
 pub use session::{Answer, Event, Session};
+use sql::ORACLE;
 use transport::ArrivalIdentity;
 use transport::claim::{NoNativeClaim, ResourceClaim};
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::sql::accept;
+use transport::sql::{COLUMN, Column, ENCODING, accept, destination};
 use transport::{Arrived, Configured, Directions, Login, Pool, Taken, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// The schemes a send target may open with.
+const SCHEMES: &[&str] = &["oracle"];
 
 /// What a Receive Location runs unless told otherwise.
 pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
 
-/// What a send runs after its INSERT: a session kept between sends does
-/// not log off, and the logoff was what committed.
+/// What runs after an INSERT or an `accept` statement: a session kept
+/// between statements is not logged off, and Oracle commits nothing until
+/// told.
 const COMMIT: &str = "COMMIT";
 
 /// What the loopback pair agrees on: one service, one user whose login the
-/// far end takes as it comes, one table and column the payload is bound
-/// into.
+/// far end demands and the near end gives, one table and column the
+/// payload is inserted into.
 const LOOPBACK_SERVICE: &str = "XMIP";
 const LOOPBACK_USER: &str = "xmip";
 const LOOPBACK_TARGET: &str = "inbox/payload";
@@ -101,6 +106,7 @@ pub struct OracleTransport {
     /// The rows refused and left, not received again while unchanged.
     /// Cloned, the same memory.
     refused: accept::RefusedRows,
+    column: Column,
     timeout: Option<Duration>,
     /// The sessions a send inserts on and a receive queries on, logged
     /// in once per server and service and kept.
@@ -123,12 +129,13 @@ impl OracleTransport {
             query: DEFAULT_QUERY.to_string(),
             accept: None,
             refused: accept::RefusedRows::default(),
+            column: Column::Binary,
             timeout: None,
             sessions: Pool::new(),
         }
     }
 
-    /// The password the login answers the session key with.
+    /// The password the login answers the challenge with.
     #[must_use]
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.login.password = password.into();
@@ -143,12 +150,18 @@ impl OracleTransport {
         self
     }
 
-    /// The statement run once a row's cycle accepted it, the
-    /// row's name in place of the dialect's first parameter
-    /// (`transport::sql::accept`).
+    /// The statement run once a row's cycle accepted it, the row's name in
+    /// place of the dialect's first parameter (`transport::sql::accept`).
     #[must_use]
     pub fn with_accept(mut self, statement: impl Into<String>) -> Self {
         self.accept = Some(statement.into());
+        self
+    }
+
+    /// What the payload column holds: bytes unless declared otherwise.
+    #[must_use]
+    pub const fn holding(mut self, column: Column) -> Self {
+        self.column = column;
         self
     }
 
@@ -186,6 +199,20 @@ impl OracleTransport {
     /// Where the connection could not be accepted or the login failed.
     pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
         Session::accept(listener, Some(&self.login), self.timeout)
+            .map(|session| session.holding(self.column))
+    }
+
+    /// Run `statement` and commit it, on the session kept for `server` and
+    /// `service`, logged in on the first statement to them.
+    fn committed(&self, server: &str, service: &str, statement: &str) -> Result<()> {
+        self.sessions.exchange(
+            &format!("{server}/{service}"),
+            || self.connect_to(server, service),
+            |client| {
+                client.execute(statement)?;
+                client.execute(COMMIT).map(|_| ())
+            },
+        )
     }
 }
 
@@ -207,56 +234,45 @@ impl Transport for OracleTransport {
         transport::Arrivals::Ordered("a poll reads again what is not yet told")
     }
 
-    /// Run the query on the session kept for the server and service, logged in on
-    /// the first receive; each row is a Stream, whole. Its verdict runs the
-    /// `accept` statement where one is declared — on `Accepted`, never on `Refused`
-    /// or `Failed` — and tells the database nothing where none is: whether a row is
-    /// read again is then the query's (a query that consumes as it reads makes
-    /// acceptance at-most-once).
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("a receive runs the query and returns")
+    }
+
+    /// Run the query on the session kept for the server and service,
+    /// logged in on the first receive; each row is a Stream, whole. Its
+    /// verdict runs the `accept` statement where one is declared — on
+    /// `Accepted`, never on `Refused` or `Failed` — and tells the database
+    /// nothing where none is.
     fn receive(&self) -> Result<Vec<Arrived>> {
         let result = self.sessions.exchange(
             &format!("{}/{}", self.server, self.service),
             || self.connect(),
-            |client| client.query(&self.query, None),
+            |client| client.query(&self.query),
         )?;
         let shared = Arc::new(self.clone());
         accept::arrivals(
             result.rows,
             &self.refused,
             |name| format!("oracle://{}/{}?row={name}", self.server, self.service),
-            |bytes| String::from_utf8_lossy(bytes).into_owned(),
-            Ok,
+            Clone::clone,
+            |value| self.column.bytes(&value, &ORACLE),
             |name| {
                 let transport = Arc::clone(&shared);
-                let quote = |name: &str| Delimiter::STRING.quote(name);
-                DIALECT.accepting(self.accept.as_deref(), name, quote, move |sql| {
-                    transport.sessions.exchange(
-                        &format!("{}/{}", transport.server, transport.service),
-                        || transport.connect(),
-                        |client| {
-                            client.execute(sql, None)?;
-                            client.execute(COMMIT, None).map(|_| ())
-                        },
-                    )
+                accept::accepting(&ORACLE, self.accept.as_deref(), name, move |sql| {
+                    transport.committed(&transport.server, &transport.service, sql)
                 })
             },
         )
     }
 
-    /// Insert the bytes as one bound RAW of one row, and commit it, on the
-    /// session kept for the server and service, logged in on the first
-    /// send to them.
+    /// Insert the bytes as one column of one row — as `HEXTORAW('…')`, or
+    /// as text where the column is declared to hold it — and commit it, on
+    /// the session kept for the server and service.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        let to = DIALECT.destination(target, &self.server, &self.service)?;
-        let insert = DIALECT.insert(to.table, to.column, DIALECT.marker);
-        self.sessions.exchange(
-            &format!("{}/{}", to.server, to.catalog),
-            || self.connect_to(to.server, to.catalog),
-            |client| {
-                client.execute(&insert, Some(bytes))?;
-                client.execute(COMMIT, None).map(|_| ())
-            },
-        )
+        let to = destination(SCHEMES, target, &self.server, &self.service)?;
+        let literal = self.column.literal(bytes, &ORACLE)?;
+        let insert = ORACLE.insert(to.table, to.column, &literal);
+        self.committed(to.server, to.database, &insert)
     }
 
     /// Rows are artefacts, and one receive holds no transaction to claim
@@ -295,6 +311,8 @@ impl Configured for OracleTransport {
                 applies: Applies::Receive,
             },
             accept::ACCEPT,
+            COLUMN,
+            ENCODING,
             Setting {
                 name: "timeout",
                 kind: Kind::Duration,
@@ -319,7 +337,7 @@ impl Configured for OracleTransport {
         if let Some(timeout) = settings.optional_duration("timeout") {
             transport = transport.timing_out_after(timeout);
         }
-        Ok(transport)
+        Ok(transport.holding(Column::configured(settings)?))
     }
 }
 
@@ -356,8 +374,9 @@ impl Loopback for OracleTransport {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
-    /// INSERT the payload as one bound RAW from a fresh near end logging in
-    /// to `address` as this transport does.
+    /// INSERT the payload as one column of one row, as the column is
+    /// declared to hold it, from a fresh near end logging in to `address`
+    /// as this transport does.
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
         let near = Self {
             server: address.to_string(),
@@ -370,8 +389,9 @@ impl Loopback for OracleTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codec::unicode::Form;
     use transport::error::TransportError;
-    use transport::payload::edge_payloads;
+    use transport::payload::{edge_payloads, sized_payloads};
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
@@ -393,6 +413,14 @@ mod tests {
         assert_eq!(built.service, "ORDERS");
         assert_eq!(built.query, "SELECT id, body FROM outbox");
         assert_eq!(built.timeout, Some(secs(2)));
+        assert_eq!(built.column, Column::Binary, "bytes unless declared");
+        let texts = [
+            text("service", "ORDERS"),
+            text("user", "xmip"),
+            text("column", "text"),
+        ];
+        let built = OracleTransport::open("db:1521", Applies::Send, &texts).expect("text");
+        assert_eq!(built.column, Column::Text(Form::Utf8), "utf-8 unless named");
         let Err(refused) = OracleTransport::open("db:1521", Applies::Send, &given[..3]) else {
             panic!("query is a receive setting");
         };
@@ -405,26 +433,36 @@ mod tests {
         let arrived = pair.round(b"it's \\here").expect("round");
         assert_eq!(arrived.bytes, b"it's \\here");
         assert!(arrived.origin_uri.starts_with("oracle://127.0.0.1:"));
-        assert!(arrived.origin_uri.ends_with("/inbox"));
+        assert!(arrived.origin_uri.ends_with("/XMIP/inbox/payload"));
         let binary = pair.round(&[0xff, 0xfe]).expect("bytes");
         assert_eq!(binary.bytes, [0xff, 0xfe]);
         assert_eq!(pair.name(), "oracle");
         assert_eq!(pair.directions(), Directions::BOTH);
+        assert!(pair.waiting().polled(), "a query returns at once");
         assert!(pair.claims().is_some(), "rows are artefacts");
         assert_eq!(pair.ceiling(), None);
     }
 
     #[test]
-    fn the_loopback_returns_the_edge_payloads_whole() {
+    fn the_loopback_returns_the_edge_and_sized_payloads_whole() {
         let pair = OracleTransport::loopback();
-        for (name, payload) in edge_payloads() {
+        for (name, payload) in edge_payloads().into_iter().chain(sized_payloads()) {
             assert!(pair.refuses(&payload).is_none(), "{name}");
             let arrived = pair.round(&payload).expect(name);
             assert_eq!(arrived.bytes, payload, "{name}");
         }
     }
 
-    /// The first of `arrived` read and refused, the rest taken.
+    #[test]
+    fn a_text_column_inserts_a_string_literal_and_refuses_what_is_not_its_form() {
+        let pair = OracleTransport::loopback().holding(Column::Text(Form::Utf8));
+        let arrived = pair.round("it's \u{e9}".as_bytes()).expect("text");
+        assert_eq!(arrived.bytes, "it's \u{e9}".as_bytes());
+        let refused = pair.send("inbox/payload", &[0xff]).expect_err("not UTF-8");
+        assert!(refused.message.contains("utf-8"), "{refused}");
+    }
+
+    /// The first of `arrived` read and failed, the rest taken.
     fn verdicts(arrived: Vec<Arrived>) -> Result<Vec<Taken>> {
         let mut taken = Vec::new();
         for (index, one) in arrived.into_iter().enumerate() {
@@ -471,11 +509,11 @@ mod tests {
             );
             Ok::<_, TransportError>(())
         });
-        let rows: [&[Option<&[u8]>]; 4] = [
-            &[Some(b"41"), Some(b"a")],
-            &[Some(b"it's"), Some(b"b")],
-            &[Some(b"43"), Some(b"c")],
-            &[None, Some(b"d")],
+        let rows: [&[Option<&str>]; 4] = [
+            &[Some("41"), Some("61")],
+            &[Some("it's"), Some("62")],
+            &[Some("43"), Some("63")],
+            &[None, Some("64")],
         ];
         let mut session = far_end
             .accept_one(&listener)
@@ -500,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn a_receive_runs_the_query_and_each_row_is_a_stream() {
+    fn a_receive_runs_the_query_and_each_row_is_a_stream_in_its_column_form() {
         let far_end = OracleTransport::new("127.0.0.1:0", "ORDERS", "xmip")
             .with_password("secret")
             .timing_out_after(secs(2));
@@ -508,9 +546,12 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             let near = OracleTransport::new(address, "ORDERS", "xmip")
                 .with_password("secret")
-                .with_query("SELECT id, kind, payload FROM inbox ORDER BY id")
+                .with_query("SELECT id, kind, RAWTOHEX(payload) FROM inbox ORDER BY id")
                 .timing_out_after(secs(2));
-            verdicts(near.receive()?)
+            let binary = verdicts(near.receive()?)?;
+            let text = near.clone().holding(Column::Text(Form::Utf8)).receive()?;
+            let refused = near.receive().map(|_| ());
+            Ok::<_, TransportError>((binary, text.len(), refused))
         });
         let mut session = far_end
             .accept_one(&listener)
@@ -518,9 +559,9 @@ mod tests {
             .with_table(
                 &["id", "kind", "payload"],
                 &[
-                    &[Some(b"41"), Some(b"order"), Some(b"ISA*00*")],
-                    &[Some(b"42"), None, Some(&[0xff, 0xfe])],
-                    &[None, Some(b""), None],
+                    &[Some("41"), Some("order"), Some("49534123")],
+                    &[Some("42"), None, Some("FFFE")],
+                    &[None, Some(""), None],
                 ],
             );
         assert_eq!(session.user(), "xmip");
@@ -528,20 +569,22 @@ mod tests {
         let event = session.next_event().expect("query").expect("one");
         assert_eq!(
             event,
-            Event::Selected("SELECT id, kind, payload FROM inbox ORDER BY id".into())
+            Event::Selected("SELECT id, kind, RAWTOHEX(payload) FROM inbox ORDER BY id".into())
         );
-        assert!(
-            session.next_event().expect("ended").is_none(),
-            "a verdict, refused or accepted, says nothing to the database"
-        );
-        let arrived = receiver.join().expect("thread").expect("receiving");
+        session.next_event().expect("as text").expect("one");
+        let mut session = session.with_table(&["id", "payload"], &[&[Some("1"), Some("x")]]);
+        session.next_event().expect("not hex").expect("one");
+        let (arrived, text, refused) = receiver.join().expect("thread").expect("receiving");
         assert_eq!(arrived.len(), 3);
-        assert_eq!(arrived[0].bytes, b"ISA*00*");
+        assert_eq!(arrived[0].bytes, b"ISA#");
         assert!(arrived[0].origin_uri.ends_with("/ORDERS?row=41"));
         assert_eq!(arrived[1].bytes, [0xff, 0xfe], "bytes are bytes");
         assert!(arrived[1].origin_uri.ends_with("?row=42"));
         assert!(arrived[2].bytes.is_empty(), "NULL is an empty Stream");
         assert!(arrived[2].origin_uri.ends_with("?row=2"));
+        assert_eq!(text, 3);
+        let refused = refused.expect_err("a binary column's value that is not hex");
+        assert!(refused.message.contains("column = \"text\""), "{refused}");
     }
 
     #[test]
@@ -555,7 +598,7 @@ mod tests {
                 .with_password("secret")
                 .timing_out_after(secs(2));
             near.send(
-                &format!("oracle://{address}/ORDERS/inbox/payload"),
+                &format!("oracle://{address}/ORDERS/INBOX/PAYLOAD"),
                 b"\0raw\xff",
             )?;
             let bad_target = near.send("oracle://host/only-one", b"x");
@@ -571,7 +614,7 @@ mod tests {
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let first = session.next_insert().expect("insert").expect("one");
         assert_eq!(first.bytes, b"\0raw\xff");
-        assert!(first.origin_uri.ends_with("/inbox"));
+        assert!(first.origin_uri.ends_with("/ORDERS/INBOX/PAYLOAD"));
         assert_eq!(
             session.next_event().expect("commit"),
             Some(Event::Executed(COMMIT.into())),
@@ -584,18 +627,10 @@ mod tests {
         assert!(nobody.message.contains("'nobody'"), "{nobody}");
         let (bad_target, refused, nobody) = sender.join().expect("thread").expect("sending");
         assert!(!bad_target.expect_err("not a column").retryable);
-        assert!(
-            refused
-                .expect_err("wrong password")
-                .message
-                .contains("ORA-01017")
-        );
-        assert!(
-            nobody
-                .expect_err("wrong user")
-                .message
-                .contains("ORA-01017")
-        );
+        let refused = refused.expect_err("wrong password");
+        assert!(refused.message.contains("ORA-01017"), "{refused}");
+        let nobody = nobody.expect_err("wrong user");
+        assert!(nobody.message.contains("ORA-01017"), "{nobody}");
     }
 
     #[test]
@@ -619,7 +654,7 @@ mod tests {
             assert!(took < Duration::from_millis(SENDS as u64), "{took:?}");
             sending.send("inbox/payload", b"after the close")
         });
-        // One connect and O5LOGON for every insert: one session accepted.
+        // One connect and login for every insert: one session accepted.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         for n in 0..SENDS {
             let inserted = session.next_insert().expect("insert").expect("one");
@@ -660,7 +695,7 @@ mod tests {
             far_end
                 .accept_one(&listener)
                 .expect("a login")
-                .with_table(&["id", "payload"], &[&[Some(&b"1"[..]), None]])
+                .with_table(&["id", "payload"], &[&[Some("1"), None]])
         };
         // One login for every query: one session accepted.
         let mut session = accept();
@@ -685,7 +720,7 @@ mod tests {
             let failed = near.receive();
             let mut client = near.connect()?;
             let banner = client.server_banner().to_string();
-            let deleted = client.execute("DELETE FROM inbox WHERE id = 41", None)?;
+            let deleted = client.execute("DELETE FROM inbox WHERE id = 41")?;
             client.close()?;
             Ok::<_, TransportError>((failed, banner, deleted))
         });

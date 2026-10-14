@@ -1,42 +1,33 @@
 //! The server's side of one connection: what a test puts at the far end,
 //! and what the loopback pair drives.
 //!
-//! Not a database. One session accepts one client's TNS connect, answers
-//! the protocol and data-type negotiation, hands out a session key and
-//! checks the verifier against the one login it expects — or takes any,
+//! Not a database, and not an Oracle listener: it speaks this crate's own
+//! wire (`tns.rs`, `ttc.rs`). One session accepts one client's connect,
+//! answers the protocol and data-type exchange, hands out a challenge and
+//! checks the answer against the one login it expects — or takes any,
 //! where none is — and answers each statement from a closure or from one
-//! fixed table: any SELECT gets the table's rows, an `INSERT ... VALUES
-//! (:1)` records its bound RAW as a Stream, anything else is done with no
-//! rows. Planning, storage and SQL are a database's.
+//! fixed table: any SELECT gets the table's rows, an INSERT of one column
+//! is recorded as a Stream — a literal in Oracle's dialect, as the column
+//! is declared to hold it — a COMMIT is done, anything else is refused
+//! with `ORA-00900`. Planning, storage and SQL are a database's.
 
 use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use codec::sql::Delimiter;
+use sql::{ORACLE, Verb};
 use transport::error::{Result, TransportError, protocol_error};
-use transport::sql::{self, Answering, Dialect, Inserted, Rows};
+use transport::sql::{Answering, Column, Inserted, Rows, next_insert, table};
 use transport::{Login, Taken, socket};
 
 use crate::tns;
 use crate::ttc::{self, Message, Ttc, TtcWrite, tag, verifier};
 
-/// Oracle as the capability writes and reads it: a target opens with
-/// `oracle://`, names a service, and an identifier is double-quoted with
-/// `""` for a quote, its case kept, or bare with `_ . $ #` in it.
-pub const DIALECT: Dialect = Dialect {
-    schemes: &["oracle"],
-    catalog: "service",
-    identifier: Delimiter::IDENTIFIER,
-    bare: &['_', '.', '$', '#'],
-    marker: ":1",
-};
-
 /// The number Oracle answers a refused login with (`ORA-01017`).
 const INVALID_CREDENTIAL: u32 = 1017;
 /// The number it answers a statement it will not run (`ORA-00900`).
 const INVALID_STATEMENT: u32 = 900;
-/// What the far end names itself in the protocol handshake.
+/// What the far end names itself in the protocol exchange.
 pub const SERVER_BANNER: &str = "Oracle Database (xmip)";
 
 /// What the client did, as [`Session::next_event`] reports it.
@@ -44,7 +35,7 @@ pub const SERVER_BANNER: &str = "Oracle Database (xmip)";
 pub enum Event {
     /// The client ran a SELECT; here it is.
     Selected(String),
-    /// The client inserted one bound value; here is the Stream.
+    /// The client inserted one value; here is the Stream.
     Inserted(Taken),
     /// The client ran something else; here it is.
     Executed(String),
@@ -64,7 +55,7 @@ impl Inserted for Event {
 pub enum Answer {
     Rows {
         columns: Vec<String>,
-        rows: Vec<Vec<Option<Vec<u8>>>>,
+        rows: Vec<Vec<Option<String>>>,
     },
     /// Done, this many rows touched.
     Complete(u64),
@@ -80,8 +71,9 @@ pub struct Session {
     peer: SocketAddr,
     user: String,
     service: String,
+    column: Column,
     columns: Vec<String>,
-    rows: Rows<Vec<u8>>,
+    rows: Rows<String>,
     answering: Option<Answering<Answer>>,
 }
 
@@ -91,8 +83,8 @@ impl Session {
     ///
     /// # Errors
     /// Where the connection could not be accepted, the client did not open
-    /// with a connect and a login, or gave the wrong verifier — which is
-    /// told to the client as `ORA-01017` before this returns.
+    /// with a connect and a login, or gave the wrong answer — which is told
+    /// to the client as `ORA-01017` before this returns.
     pub fn accept(
         listener: &TcpListener,
         expected: Option<&Login>,
@@ -106,6 +98,7 @@ impl Session {
             peer,
             user: String::new(),
             service: String::new(),
+            column: Column::Binary,
             columns: Vec::new(),
             rows: Vec::new(),
             answering: None,
@@ -173,10 +166,18 @@ impl Session {
         &self.service
     }
 
+    /// What the column an INSERT names holds: bytes unless declared
+    /// otherwise.
+    #[must_use]
+    pub const fn holding(mut self, column: Column) -> Self {
+        self.column = column;
+        self
+    }
+
     /// Answer any SELECT with these `columns` and `rows`.
     #[must_use]
-    pub fn with_table(mut self, columns: &[&str], rows: &[&[Option<&[u8]>]]) -> Self {
-        (self.columns, self.rows) = sql::table(columns, rows);
+    pub fn with_table(mut self, columns: &[&str], rows: &[&[Option<&str>]]) -> Self {
+        (self.columns, self.rows) = table(columns, rows);
         self
     }
 
@@ -196,7 +197,7 @@ impl Session {
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
     pub fn next_insert(&mut self) -> Result<Option<Taken>> {
-        sql::next_insert(|| self.next_event())
+        next_insert(|| self.next_event())
     }
 
     /// The next statement the client ran, answered, or `None` when it
@@ -218,10 +219,8 @@ impl Session {
                 message.tag
             )));
         }
-        let mut reader = message.cursor();
-        let sql = reader.string()?;
-        let bind = reader.value()?;
-        let (answer, event) = self.answer(&sql, bind);
+        let sql = message.cursor().string()?;
+        let (answer, event) = self.answer(&sql);
         self.write_answer(&answer)?;
         Ok(Some(event))
     }
@@ -238,38 +237,40 @@ impl Session {
         Ok(events)
     }
 
-    fn answer(&mut self, sql: &str, bind: Option<Vec<u8>>) -> (Answer, Event) {
+    fn answer(&mut self, sql: &str) -> (Answer, Event) {
         if let Some(answer) = self.answering.as_mut().and_then(|f| f(sql)) {
             return (answer, Event::Executed(sql.to_string()));
         }
-        let verb = sql::verb(sql);
-        match verb.as_str() {
-            "SELECT" => (
-                Answer::Rows {
+        let inserted = match Verb::of_statement(sql) {
+            Some(Verb::Select) => {
+                let rows = Answer::Rows {
                     columns: self.columns.clone(),
                     rows: self.rows.clone(),
-                },
-                Event::Selected(sql.to_string()),
-            ),
-            "INSERT" if let Some((table, _, ())) = DIALECT.parse_insert(sql, bind_marker) => {
-                let origin = format!("oracle://{}/{table}", self.peer);
-                (
-                    Answer::Complete(1),
-                    Event::Inserted(Taken::new(origin, bind.unwrap_or_default())),
-                )
+                };
+                return (rows, Event::Selected(sql.to_string()));
             }
             // What a client that keeps its session commits with, where a
             // logoff would have committed.
-            "COMMIT" => (Answer::Complete(0), Event::Executed(sql.to_string())),
-            _ => (
-                Answer::Error {
-                    code: INVALID_STATEMENT,
-                    message: "only SELECT, INSERT ... VALUES (:1) and COMMIT are served here"
-                        .to_string(),
-                },
-                Event::Executed(sql.to_string()),
-            ),
-        }
+            Some(Verb::Commit) => {
+                return (Answer::Complete(0), Event::Executed(sql.to_string()));
+            }
+            Some(Verb::Insert) => ORACLE.parse_insert_literal(sql),
+            _ => None,
+        };
+        let Some((table, column, value)) = inserted else {
+            let refused = Answer::Error {
+                code: INVALID_STATEMENT,
+                message: "only SELECT, INSERT INTO t (c) VALUES (...) and COMMIT are served here"
+                    .to_string(),
+            };
+            return (refused, Event::Executed(sql.to_string()));
+        };
+        let origin = format!("oracle://{}/{}/{table}/{column}", self.peer, self.service);
+        let stored = self.column.stored(value);
+        (
+            Answer::Complete(1),
+            Event::Inserted(Taken::new(origin, stored)),
+        )
     }
 
     fn write_answer(&mut self, answer: &Answer) -> Result<()> {
@@ -285,7 +286,7 @@ impl Session {
                     let mut body = Vec::new();
                     body.count(row.len());
                     for value in row {
-                        body.value(value.as_deref());
+                        body.value(value.as_deref().map(str::as_bytes));
                     }
                     self.send(tag::ROW, body)?;
                 }
@@ -336,11 +337,6 @@ fn service_name(connect_string: &str) -> String {
         .to_string()
 }
 
-/// The one bind marker the INSERT carries, and what follows it.
-fn bind_marker(rest: &str) -> Option<((), &str)> {
-    rest.strip_prefix(DIALECT.marker).map(|tail| ((), tail))
-}
-
 /// Sixteen random bytes: the challenge a login is verified against.
 fn fresh_challenge() -> [u8; 16] {
     codec::random::array()
@@ -351,21 +347,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_challenge_is_sixteen_bytes_and_fresh_and_an_insert_is_read_for_the_origin() {
+    fn a_challenge_is_sixteen_bytes_and_fresh_and_a_service_is_read_from_a_connect() {
         let first = fresh_challenge();
         assert_eq!(first.len(), 16);
         assert_ne!(first, fresh_challenge());
-        let table = |sql: &str| {
-            DIALECT
-                .parse_insert(sql, bind_marker)
-                .map(|(table, ..)| table)
-        };
         assert_eq!(
-            table("INSERT INTO inbox(payload) VALUES (:1)").expect("bare"),
-            "inbox"
+            service_name("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=ORDERS)))"),
+            "ORDERS"
         );
-        let quoted = DIALECT.insert("in\"box", "payload", DIALECT.marker);
-        assert_eq!(table(&quoted).expect("quoted"), "in\"box");
-        assert!(table("INSERT INTO inbox (payload) VALUES ('x')").is_none());
+        assert_eq!(service_name("ORDERS"), "ORDERS");
     }
 }

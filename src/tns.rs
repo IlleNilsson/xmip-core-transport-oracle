@@ -4,6 +4,11 @@
 //! carry a session: Connect offers a service, Accept agrees the sizes,
 //! Refuse says no, Data carries the two-task layer under a two-byte data
 //! flag, and Marker breaks in. Nothing here knows what the data means.
+//!
+//! The header is Oracle Net's; the bodies are not yet: a real connect
+//! carries its service options, unit sizes and the offset of its connect
+//! data, and a real accept answers them, where this connect carries a
+//! version and the connect string, and this accept the version.
 
 use std::io::{Read, Write};
 

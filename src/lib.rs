@@ -243,7 +243,7 @@ impl Transport for OracleTransport {
     /// verdict runs the `accept` statement where one is declared — on
     /// `Accepted`, never on `Refused` or `Failed` — and tells the database
     /// nothing where none is.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         let result = self.sessions.exchange(
             &format!("{}/{}", self.server, self.service),
             || self.connect(),
@@ -252,6 +252,7 @@ impl Transport for OracleTransport {
         let shared = Arc::new(self.clone());
         accept::arrivals(
             result.rows,
+            most,
             &self.refused,
             |name| format!("oracle://{}/{}?row={name}", self.server, self.service),
             Clone::clone,
@@ -265,10 +266,15 @@ impl Transport for OracleTransport {
         )
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("an INSERT carries the body as one literal in its statement")
+    }
+
     /// Insert the bytes as one column of one row — as `HEXTORAW('…')`, or
     /// as text where the column is declared to hold it — and commit it, on
     /// the session kept for the server and service.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         let to = destination(SCHEMES, target, &self.server, &self.service)?;
         let literal = self.column.literal(bytes, &ORACLE)?;
         let insert = ORACLE.insert(to.table, to.column, &literal);

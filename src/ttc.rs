@@ -187,7 +187,7 @@ impl TtcWrite for Vec<u8> {
 pub fn verifier(challenge: &[u8; 16], password: &[u8]) -> [u8; 16] {
     let mut state = *challenge;
     // Three passes fold the password into the challenge, each byte turned
-    // by its neighbour so a one-byte change spreads across the block.
+    // by its neighbor so a one-byte change spreads across the block.
     for pass in 0u8..3 {
         for i in 0..16 {
             let key = password

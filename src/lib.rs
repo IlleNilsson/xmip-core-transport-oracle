@@ -33,7 +33,7 @@
 //! TCPS is not spoken; where it is, it is `xmip-core-library-tls`'s
 //! (ADR-0033).
 //!
-//! Rows are artefacts and this transport claims none of them, per
+//! Rows are artifacts and this transport claims none of them, per
 //! ADR-0024: the atomic claim a database has, `SELECT … FOR UPDATE SKIP
 //! LOCKED`, holds only inside a transaction, and none is held across a
 //! Stream's lifetime. The query itself — a status column — is what keeps a
@@ -281,7 +281,7 @@ impl Transport for OracleTransport {
         self.committed(to.server, to.database, &insert)
     }
 
-    /// Rows are artefacts, and one receive holds no transaction to claim
+    /// Rows are artifacts, and one receive holds no transaction to claim
     /// one in.
     fn claims(&self) -> Option<&dyn ResourceClaim> {
         Some(&NoNativeClaim)
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(pair.name(), "oracle");
         assert_eq!(pair.directions(), Directions::BOTH);
         assert!(pair.waiting().polled(), "a query returns at once");
-        assert!(pair.claims().is_some(), "rows are artefacts");
+        assert!(pair.claims().is_some(), "rows are artifacts");
         assert_eq!(pair.ceiling(), None);
     }
 

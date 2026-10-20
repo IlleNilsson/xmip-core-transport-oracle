@@ -215,7 +215,7 @@ fn error_of(message: &Message) -> TransportError {
 }
 
 /// An `ORA-` error, retryable where it is a resource shortage, a lock, a
-/// serialisation failure or a listener not yet up — what a later attempt
+/// serialization failure or a listener not yet up — what a later attempt
 /// might not meet.
 #[must_use]
 pub fn oracle_error(code: u32, message: &str) -> TransportError {

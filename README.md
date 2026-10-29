@@ -78,8 +78,8 @@ value of the result, read whole.
 A Send Location inserts on a session logged in once per server and service and
 kept (`transport::Pool`), and commits each insert. A Receive Location runs its
 query on a session kept the same way, replaced where the listener closed it.
-The login is the transport capability's `Login`; the password comes through the
-Location's credentials, never a setting.
+The login is the transport capability's `Login`; the password is the secret the
+Location names, never a setting.
 
 ## Toolchain
 

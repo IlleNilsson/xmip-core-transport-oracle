@@ -124,7 +124,7 @@ impl Client {
                     result.columns = reader
                         .values()?
                         .into_iter()
-                        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                        .map(String::from_utf8_lossy_owned)
                         .collect();
                 }
                 tag::ROW => result.rows.push(read_row(&message)?),

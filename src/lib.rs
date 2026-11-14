@@ -54,6 +54,13 @@
 //! ?row=41`. A send target is `oracle://host:1521/<service>/<table>
 //! /<column>`, `host:1521/<service>/<table>/<column>`, or
 //! `<table>/<column>` on the configured server and service.
+//!
+//! **The transport is every SQL technology's**, `transport::sql`'s
+//! `SqlTransport` over this crate's [`Oracle`] wire (2026-11-13): the
+//! query and its rows, the `accept` statement after a row's cycle, the
+//! INSERT a send writes, the sessions kept per server and service, the
+//! settings. What is Oracle's own is this crate's: its dialect, the commit
+//! after each statement, and the wire, both halves.
 
 pub mod client;
 mod configured;
@@ -62,280 +69,95 @@ pub mod tns;
 pub mod ttc;
 
 use std::net::TcpListener;
-use std::sync::Arc;
 use std::time::Duration;
 
 pub use client::{Client, QueryResult, oracle_error};
 pub use session::{Answer, Event, Session};
-use sql::ORACLE;
-use transport::ArrivalIdentity;
-use transport::claim::{NoNativeClaim, ResourceClaim};
+use sql::{Dialect, ORACLE};
 use transport::error::{Result, protocol_error};
-use transport::listening::{Accepting, Listening};
-use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
-use transport::sql::{Column, accept, destination};
-use transport::{Arrived, Directions, Login, Pool, Taken, Transport};
-
-/// The schemes a send target may open with.
-const SCHEMES: &[&str] = &["oracle"];
-
-/// What a Receive Location runs unless told otherwise.
-pub const DEFAULT_QUERY: &str = "SELECT id, payload FROM inbox ORDER BY id";
+use transport::sql::{Probe, Rows, SqlTransport, Wire};
+use transport::{Login, Pooled, Taken};
+use xcore::settings::Settings;
 
 /// What runs after an INSERT or an `accept` statement: a session kept
 /// between statements is not logged off, and Oracle commits nothing until
 /// told.
 const COMMIT: &str = "COMMIT";
 
-/// What the loopback pair agrees on: one service, one user whose login the
-/// far end demands and the near end gives, one table and column the
-/// payload is inserted into.
-const LOOPBACK_SERVICE: &str = "XMIP";
-const LOOPBACK_USER: &str = "xmip";
-const LOOPBACK_TARGET: &str = "inbox/payload";
+/// A Location over an Oracle Database, its server's database the service
+/// it connects for.
+pub type OracleTransport = SqlTransport<Oracle>;
 
-#[derive(Clone)]
-pub struct OracleTransport {
-    /// The secret its Location names, whose password the login presents,
-    /// read at each login (ADR-0019, amendment 2026-10-29).
-    secret: Option<transport::Secured>,
-    server: String,
-    service: String,
-    login: Login,
-    query: String,
-    /// The statement run on a row's verdict, its name bound in.
-    accept: Option<String>,
-    /// The rows refused and left, not received again while unchanged.
-    /// Cloned, the same memory.
-    refused: accept::RefusedRows,
-    column: Column,
-    timeout: Option<Duration>,
-    /// The sessions a send inserts on and a receive queries on, logged
-    /// in once per server and service and kept.
-    sessions: Pool<Client>,
-}
+/// Oracle's wire: this crate's TNS and two-task client, every statement
+/// committed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Oracle;
 
-impl OracleTransport {
-    /// Speak to the listener at `server`, for `service`, as `user` with no
-    /// password until one is given.
-    #[must_use]
-    pub fn new(
-        server: impl Into<String>,
-        service: impl Into<String>,
-        user: impl Into<String>,
-    ) -> Self {
-        Self {
-            secret: None,
-            server: server.into(),
-            service: service.into(),
-            login: Login::new(user, ""),
-            query: DEFAULT_QUERY.to_string(),
-            accept: None,
-            refused: accept::RefusedRows::default(),
-            column: Column::Binary,
-            timeout: None,
-            sessions: Pool::new(),
-        }
+impl Wire for Oracle {
+    type Client = Client;
+
+    const NAME: &'static str = "oracle";
+    const SCHEMES: &'static [&'static str] = &["oracle"];
+    const SETTINGS: &'static Settings = configured::SETTINGS;
+    const DATABASE: &'static str = configured::SERVICE.name;
+    /// One service, one user whose login the far end demands and the near
+    /// end gives.
+    const PROBE: Probe = Probe {
+        database: "XMIP",
+        user: "xmip",
+        password: "",
+        target: "inbox/payload",
+    };
+
+    fn dialect() -> &'static Dialect {
+        &ORACLE
     }
 
-    /// The password the login answers the challenge with.
-    #[must_use]
-    pub fn with_password(mut self, password: impl Into<String>) -> Self {
-        self.login.password = password.into();
-        self
+    /// `service` as the connect string a listener reads it out of.
+    fn connect(
+        &self,
+        server: &str,
+        service: &str,
+        login: &Login,
+        timeout: Option<Duration>,
+    ) -> Result<Client> {
+        let connect = format!("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME={service})))");
+        Client::connect(server, &connect, login, timeout)
     }
 
-    /// The query a receive runs: the first column is the row's name, the
-    /// last is the Stream.
-    #[must_use]
-    pub fn with_query(mut self, query: impl Into<String>) -> Self {
-        self.query = query.into();
-        self
+    fn usable(client: &mut Client) -> bool {
+        client.usable()
     }
 
-    /// The statement run once a row's cycle accepted it, the row's name in
-    /// place of the dialect's first parameter (`transport::sql::accept`).
-    #[must_use]
-    pub fn with_accept(mut self, statement: impl Into<String>) -> Self {
-        self.accept = Some(statement.into());
-        self
+    fn query(client: &mut Client, sql: &str) -> Result<Rows<String>> {
+        Ok(client.query(sql)?.rows)
     }
 
-    /// What the payload column holds: bytes unless declared otherwise.
-    #[must_use]
-    pub const fn holding(mut self, column: Column) -> Self {
-        self.column = column;
-        self
+    /// `sql`, then [`COMMIT`].
+    fn execute(client: &mut Client, sql: &str) -> Result<()> {
+        client.execute(sql)?;
+        client.execute(COMMIT).map(|_| ())
     }
 
-    /// Give up on a server that stops mid-packet.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Connect and log in.
-    ///
-    /// # Errors
-    /// Where the server could not be reached or refused the login.
-    pub fn connect(&self) -> Result<Client> {
-        self.connect_to(&self.server, &self.service)
-    }
-
-    fn connect_to(&self, server: &str, service: &str) -> Result<Client> {
-        let login = transport::secured::logged_in(&self.login, self.secret.as_ref(), "oracle")?;
-        Client::connect(server, &connect_string(service), &login, self.timeout)
-    }
-
-    /// Bind as the listener clients connect to, and report the address.
-    ///
-    /// # Errors
-    /// Where the address is taken, malformed, or not permitted.
-    pub fn bind(&self) -> Result<(TcpListener, String)> {
-        socket::bind_tcp(&self.server)
-    }
-
-    /// Accept one client on an already-bound listener, demanding this
-    /// transport's login.
-    ///
-    /// # Errors
-    /// Where the connection could not be accepted or the login failed.
-    pub fn accept_one(&self, listener: &TcpListener) -> Result<Session> {
-        Session::accept(listener, Some(&self.login), self.timeout)
-            .map(|session| session.holding(self.column))
-    }
-
-    /// Run `statement` and commit it, on the session kept for `server` and
-    /// `service`, logged in on the first statement to them.
-    fn committed(&self, server: &str, service: &str, statement: &str) -> Result<()> {
-        self.sessions.exchange(
-            &format!("{server}/{service}"),
-            || self.connect_to(server, service),
-            |client| {
-                client.execute(statement)?;
-                client.execute(COMMIT).map(|_| ())
-            },
-        )
-    }
-}
-
-/// A connect string a listener reads a service out of.
-fn connect_string(service: &str) -> String {
-    format!("(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME={service})))")
-}
-
-impl Transport for OracleTransport {
-    fn name(&self) -> &'static str {
-        "oracle"
-    }
-
-    fn directions(&self) -> Directions {
-        Directions::BOTH
-    }
-
-    fn arrivals(&self) -> transport::Arrivals {
-        transport::Arrivals::Ordered("a poll reads again what is not yet told")
-    }
-
-    fn waiting(&self) -> transport::Waiting {
-        transport::Waiting::Polled("a receive runs the query and returns")
-    }
-
-    /// Run the query on the session kept for the server and service,
-    /// logged in on the first receive; each row is a Stream, whole. Its
-    /// verdict runs the `accept` statement where one is declared — on
-    /// `Accepted`, never on `Refused` or `Failed` — and tells the database
-    /// nothing where none is.
-    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
-        let result = self.sessions.exchange(
-            &format!("{}/{}", self.server, self.service),
-            || self.connect(),
-            |client| client.query(&self.query),
-        )?;
-        let shared = Arc::new(self.clone());
-        accept::arrivals(
-            result.rows,
-            most,
-            &self.refused,
-            |name| format!("oracle://{}/{}?row={name}", self.server, self.service),
-            Clone::clone,
-            |value| self.column.bytes(&value, &ORACLE),
-            |name| {
-                let transport = Arc::clone(&shared);
-                accept::accepting(&ORACLE, self.accept.as_deref(), name, move |sql| {
-                    transport.committed(&transport.server, &transport.service, sql)
-                })
-            },
-        )
-    }
-
-    fn sending(&self) -> transport::Sending {
-        transport::Sending::Gathered("an INSERT carries the body as one literal in its statement")
-    }
-
-    /// Insert the bytes as one column of one row — as `HEXTORAW('…')`, or
-    /// as text where the column is declared to hold it — and commit it, on
-    /// the session kept for the server and service.
-    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
-        let bytes: &[u8] = &outgoing.gather()?;
-        let to = destination(SCHEMES, target, &self.server, &self.service)?;
-        let literal = self.column.literal(bytes, &ORACLE)?;
-        let insert = ORACLE.insert(to.table, to.column, &literal);
-        self.committed(to.server, to.database, &insert)
-    }
-
-    /// Rows are artifacts, and one receive holds no transaction to claim
-    /// one in.
-    fn claims(&self) -> Option<&dyn ResourceClaim> {
-        Some(&NoNativeClaim)
-    }
-}
-
-impl OracleTransport {
-    /// Both ends on this machine: an ephemeral local port, a login with no
-    /// password, the loopback timeout.
-    #[must_use]
-    pub fn loopback() -> Self {
-        Self::new("127.0.0.1:0", LOOPBACK_SERVICE, LOOPBACK_USER).timing_out_after(LOOPBACK_TIMEOUT)
-    }
-}
-
-impl Accepting for OracleTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
-        let mut session = self.accept_one(listener)?;
+    /// The INSERT, and the COMMIT that follows answered; the client keeps
+    /// its session for the next insert.
+    fn take_one(transport: &OracleTransport, listener: &TcpListener) -> Result<Taken> {
+        let mut session = accept_one(transport, listener)?;
         let arrived = session
             .next_insert()?
             .ok_or_else(|| protocol_error("the client logged off without inserting"))?;
-        // Answer the COMMIT that follows; the client keeps its session for
-        // the next insert.
         session.next_event()?;
         Ok(arrived)
     }
 }
 
-impl Loopback for OracleTransport {
-    fn arrival_identity(&self) -> ArrivalIdentity {
-        ArrivalIdentity::Unnamed(
-            "a row names no sender: the database it was read from is in its origin",
-        )
-    }
-
-    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
-    }
-
-    /// INSERT the payload as one column of one row, as the column is
-    /// declared to hold it, from a fresh near end logging in to `address`
-    /// as this transport does.
-    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
-        let near = Self {
-            server: address.to_string(),
-            ..self.clone()
-        };
-        near.send(LOOPBACK_TARGET, payload)
-    }
+/// Accept one client on a listener `transport` bound, demanding its login.
+///
+/// # Errors
+/// Where the connection could not be accepted or the login failed.
+pub fn accept_one(transport: &OracleTransport, listener: &TcpListener) -> Result<Session> {
+    Session::accept(listener, Some(transport.login()), transport.timeout())
+        .map(|session| session.holding(transport.column()))
 }
 
 #[cfg(test)]
@@ -346,6 +168,8 @@ mod tests {
     use transport::Configured;
     use transport::error::TransportError;
     use transport::payload::{edge_payloads, sized_payloads};
+    use transport::sql::{Column, DEFAULT_QUERY};
+    use transport::{Arrived, Directions, Loopback, Transport};
     use xcore::settings::Applies;
 
     fn secs(n: u64) -> Duration {
@@ -364,18 +188,22 @@ mod tests {
             text("timeout", "2s"),
         ];
         let built = OracleTransport::open("db:1521", Applies::Receive, &given).expect("built");
-        assert_eq!(built.server, "db:1521");
-        assert_eq!(built.service, "ORDERS");
-        assert_eq!(built.query, "SELECT id, body FROM outbox");
-        assert_eq!(built.timeout, Some(secs(2)));
-        assert_eq!(built.column, Column::Binary, "bytes unless declared");
+        assert_eq!(built.server(), "db:1521");
+        assert_eq!(built.database(), "ORDERS");
+        assert_eq!(built.query(), "SELECT id, body FROM outbox");
+        assert_eq!(built.timeout(), Some(secs(2)));
+        assert_eq!(built.column(), Column::Binary, "bytes unless declared");
         let texts = [
             text("service", "ORDERS"),
             text("user", "xmip"),
             text("column", "text"),
         ];
         let built = OracleTransport::open("db:1521", Applies::Send, &texts).expect("text");
-        assert_eq!(built.column, Column::Text(Form::Utf8), "utf-8 unless named");
+        assert_eq!(
+            built.column(),
+            Column::Text(Form::Utf8),
+            "utf-8 unless named"
+        );
         let Err(refused) = OracleTransport::open("db:1521", Applies::Send, &given[..3]) else {
             panic!("query is a receive setting");
         };
@@ -470,8 +298,7 @@ mod tests {
             &[Some("43"), Some("63")],
             &[None, Some("64")],
         ];
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("accepting")
             .with_table(&["id", "payload"], &rows)
             .answering(|sql| sql.starts_with("DELETE").then_some(Answer::Complete(1)));
@@ -508,8 +335,7 @@ mod tests {
             let refused = near.receive().map(|_| ());
             Ok::<_, TransportError>((binary, text.len(), refused))
         });
-        let mut session = far_end
-            .accept_one(&listener)
+        let mut session = accept_one(&far_end, &listener)
             .expect("accepting")
             .with_table(
                 &["id", "kind", "payload"],
@@ -566,7 +392,7 @@ mod tests {
                 .send("inbox/payload", b"x");
             Ok::<_, TransportError>((bad_target, refused, nobody))
         });
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = accept_one(&far_end, &listener).expect("accepting");
         let first = session.next_insert().expect("insert").expect("one");
         assert_eq!(first.bytes, b"\0raw\xff");
         assert!(first.origin_uri.ends_with("/ORDERS/INBOX/PAYLOAD"));
@@ -576,9 +402,11 @@ mod tests {
             "committed, since the session is kept rather than logged off"
         );
         drop(session);
-        let wrong = far_end.accept_one(&listener).err().expect("wrong password");
+        let wrong = accept_one(&far_end, &listener)
+            .err()
+            .expect("wrong password");
         assert!(wrong.message.contains("ORA-01017"), "{wrong}");
-        let nobody = far_end.accept_one(&listener).err().expect("wrong user");
+        let nobody = accept_one(&far_end, &listener).err().expect("wrong user");
         assert!(nobody.message.contains("'nobody'"), "{nobody}");
         let (bad_target, refused, nobody) = sender.join().expect("thread").expect("sending");
         assert!(!bad_target.expect_err("not a column").retryable);
@@ -606,19 +434,19 @@ mod tests {
             sending.send("inbox/payload", b"after the close")
         });
         // One connect and login for every insert: one session accepted.
-        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let mut session = accept_one(&far_end, &listener).expect("accepting");
         for n in 0..SENDS {
             let inserted = session.next_insert().expect("insert").expect("one");
             assert_eq!(inserted.bytes, n.to_string().as_bytes());
         }
         session.next_event().expect("the last commit");
         drop(session);
-        let mut again = far_end.accept_one(&listener).expect("a new login");
+        let mut again = accept_one(&far_end, &listener).expect("a new login");
         let last = again.next_insert().expect("insert").expect("one");
         assert_eq!(last.bytes, b"after the close");
         again.next_event().expect("its commit");
         sender.join().expect("thread").expect("sending");
-        assert_eq!(near.sessions.opened(), 2);
+        assert_eq!(near.opened(), 2);
     }
 
     #[test]
@@ -639,8 +467,7 @@ mod tests {
             receiving.receive()
         });
         let accept = || {
-            far_end
-                .accept_one(&listener)
+            accept_one(&far_end, &listener)
                 .expect("a login")
                 .with_table(&["id", "payload"], &[&[Some("1"), None]])
         };
@@ -654,7 +481,7 @@ mod tests {
         let mut again = accept();
         assert_matches!(again.next_event(), Ok(Some(Event::Selected(_))));
         assert_eq!(receiver.join().expect("thread").expect("after").len(), 1);
-        assert_eq!(near.sessions.opened(), 2);
+        assert_eq!(near.opened(), 2);
     }
 
     #[test]
@@ -671,8 +498,7 @@ mod tests {
             client.close()?;
             Ok::<_, TransportError>((failed, banner, deleted))
         });
-        let session = far_end
-            .accept_one(&listener)
+        let session = accept_one(&far_end, &listener)
             .expect("accepting")
             .answering(|sql| {
                 sql.starts_with("SELECT").then(|| Answer::Error {
@@ -681,8 +507,7 @@ mod tests {
                 })
             });
         assert_eq!(session.serve().expect("served").len(), 1);
-        let session = far_end
-            .accept_one(&listener)
+        let session = accept_one(&far_end, &listener)
             .expect("again")
             .answering(|sql| sql.starts_with("DELETE").then_some(Answer::Complete(3)));
         assert_eq!(

@@ -6,6 +6,12 @@ INSERT. A technology of
 Oracle is a transport here and nothing more: no Storage server speaks it, and
 nothing of it is in the foundation (the owner, 2026-10-14).
 
+The transport is every SQL technology's, `transport::sql::SqlTransport`, over
+this crate's `Oracle` wire (2026-11-13): its name and scheme, its settings —
+`service` in place of a database — the Oracle dialect, the commit after every
+statement, and the wire below, both halves, which stays here (`accept_one`
+serves the far end).
+
 ## What it speaks
 
 A session goes as Oracle Net goes: a TNS connect naming the service and its

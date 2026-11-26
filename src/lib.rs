@@ -61,45 +61,68 @@
 //! INSERT a send writes, the sessions kept per server and service, the
 //! settings. What is Oracle's own is this crate's: its dialect, the commit
 //! after each statement, and the wire, both halves.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
-mod configured;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod session;
+#[cfg(feature = "default")]
 pub mod tns;
+#[cfg(feature = "default")]
 pub mod ttc;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::{Client, QueryResult, oracle_error};
+#[cfg(feature = "default")]
 pub use session::{Answer, Event, Session};
+#[cfg(feature = "default")]
 use sql::{Dialect, ORACLE};
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
 use transport::sql::{Probe, Rows, SqlTransport, Wire};
+#[cfg(feature = "default")]
 use transport::{Login, Pooled, Taken};
+#[cfg(feature = "default")]
 use xcore::settings::Settings;
 
 /// What runs after an INSERT or an `accept` statement: a session kept
 /// between statements is not logged off, and Oracle commits nothing until
 /// told.
+#[cfg(feature = "default")]
 const COMMIT: &str = "COMMIT";
 
 /// A Location over an Oracle Database, its server's database the service
 /// it connects for.
+#[cfg(feature = "default")]
 pub type OracleTransport = SqlTransport<Oracle>;
 
 /// Oracle's wire: this crate's TNS and two-task client, every statement
 /// committed.
+#[cfg(feature = "default")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Oracle;
 
+#[cfg(feature = "default")]
 impl Wire for Oracle {
     type Client = Client;
 
     const NAME: &'static str = "oracle";
-    const SCHEMES: &'static [&'static str] = &["oracle"];
-    const SETTINGS: &'static Settings = configured::SETTINGS;
-    const DATABASE: &'static str = configured::SERVICE.name;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const DATABASE: &'static str = declaration::SERVICE.name;
     /// One service, one user whose login the far end demands and the near
     /// end gives.
     const PROBE: Probe = Probe {
@@ -155,6 +178,7 @@ impl Wire for Oracle {
 ///
 /// # Errors
 /// Where the connection could not be accepted or the login failed.
+#[cfg(feature = "default")]
 pub fn accept_one(transport: &OracleTransport, listener: &TcpListener) -> Result<Session> {
     Session::accept(listener, Some(transport.login()), transport.timeout())
         .map(|session| session.holding(transport.column()))

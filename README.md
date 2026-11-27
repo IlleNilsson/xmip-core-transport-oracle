@@ -92,11 +92,6 @@ node in their process loaded the technology. `test/Declaration.Test.ps1` in the
 estate holds that the declaration builds nothing the transport capability does
 not.
 
-## Toolchain
-
-`rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
-here.
-
 ## Verification
 
 The included workflow is manual-only and calls the versioned shared workflow at

@@ -61,25 +61,12 @@ after a receive that found nothing, the runtime waits its poll interval.
 
 ## Acknowledgement
 
-The Location's query only reads; what consumes a row is the `accept`
-statement, run after the row's receive cycle. `accept` (text, receive side,
-optional) is a statement — `DELETE FROM inbox WHERE id = :1`, an `UPDATE` of
-a status column — with the row's name, the query's first column as the origin
-carries it, in place of `:1`, written as Oracle's string literal
-(`transport::sql::accept`), so whatever the column holds stays one value. It
-runs on the session kept for the server and service, and is committed:
-
-- **Accepted**: `accept` runs; the row is consumed once its Stream is Xmip's.
-- **Refused**: nothing runs. A refusal is not a consumption: the row is the
-  only copy, so it is left where it lies, and this Location does not receive
-  it again while its body is unchanged; a row whose body changed is a new
-  arrival. The memory is the node process's (`transport::refused`).
-- **Failed**: nothing runs, and the next receive reads the row again.
-
-A row whose first column is NULL has no name to bind, and nothing runs for it.
-Where `accept` is left out a row's verdict tells the database nothing: every
-row is read again unless the query keeps it from that. Each row is a whole
-value of the result, read whole.
+`accept` is every SQL technology's (`transport::sql::accept`):
+[xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport)'s
+README. On Oracle it is a statement — `DELETE FROM inbox WHERE id = :1`, an
+`UPDATE` of a status column — with the row's name in place of `:1`, written as
+Oracle's string literal; it runs on the session kept for the server and
+service, and is committed.
 
 A Send Location inserts on a session logged in once per server and service and
 kept (`transport::Pool`), and commits each insert. A Receive Location runs its
